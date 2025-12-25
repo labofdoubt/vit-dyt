@@ -205,6 +205,12 @@ def get_args_parser():
     parser.add_argument('--dynamic_tanh', type=str2bool, default=False)
     parser.add_argument('--dyt_alpha_init_value', type=float, default=0.5,
                         help='Initial value for DyT alpha (only used when --dynamic_tanh true).')
+    parser.add_argument('--save_init_ckpt', type=str2bool, default=False,
+                        help='If true, save a checkpoint right after initialization (before training).')
+    parser.add_argument('--save_best_ckpt', type=str2bool, default=True,
+                        help='If true, save checkpoint-best when validation acc improves.')
+    parser.add_argument('--save_best_ema_ckpt', type=str2bool, default=True,
+                        help='If true, save checkpoint-best-ema when EMA validation acc improves.')
 
     return parser
 
@@ -401,6 +407,12 @@ def main(args):
         args=args, model=model, model_without_ddp=model_without_ddp,
         optimizer=optimizer, loss_scaler=loss_scaler, model_ema=model_ema)
 
+    # Optional: save an init checkpoint (model + optimizer + scaler) before training
+    if args.output_dir and args.save_ckpt and args.save_init_ckpt:
+        utils.save_model(
+            args=args, model=model, model_without_ddp=model_without_ddp, optimizer=optimizer,
+            loss_scaler=loss_scaler, epoch="init", model_ema=model_ema)
+
     if args.eval:
         print(f"Eval only mode")
         test_stats = evaluate(data_loader_val, model, device, use_amp=args.use_amp)
@@ -438,7 +450,7 @@ def main(args):
             print(f"Accuracy of the model on the {len(dataset_val)} test images: {test_stats['acc1']:.1f}%")
             if max_accuracy < test_stats["acc1"]:
                 max_accuracy = test_stats["acc1"]
-                if args.output_dir and args.save_ckpt:
+                if args.output_dir and args.save_ckpt and args.save_best_ckpt:
                     utils.save_model(
                         args=args, model=model, model_without_ddp=model_without_ddp, optimizer=optimizer,
                         loss_scaler=loss_scaler, epoch="best", model_ema=model_ema)
@@ -460,7 +472,7 @@ def main(args):
                 print(f"Accuracy of the model EMA on {len(dataset_val)} test images: {test_stats_ema['acc1']:.1f}%")
                 if max_accuracy_ema < test_stats_ema["acc1"]:
                     max_accuracy_ema = test_stats_ema["acc1"]
-                    if args.output_dir and args.save_ckpt:
+                    if args.output_dir and args.save_ckpt and args.save_best_ema_ckpt:
                         utils.save_model(
                             args=args, model=model, model_without_ddp=model_without_ddp, optimizer=optimizer,
                             loss_scaler=loss_scaler, epoch="best-ema", model_ema=model_ema)
