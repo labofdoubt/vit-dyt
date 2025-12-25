@@ -26,12 +26,16 @@ class DynamicTanh(nn.Module):
         return f"normalized_shape={self.normalized_shape}, alpha_init_value={self.alpha_init_value}, channels_last={self.channels_last}"
 
 
-def convert_ln_to_dyt(module):
+def convert_ln_to_dyt(module, alpha_init_value=0.5):
     module_output = module
     if isinstance(module, nn.LayerNorm):
-        module_output = DynamicTanh(module.normalized_shape, not isinstance(module, LayerNorm2d))
+        module_output = DynamicTanh(
+            module.normalized_shape,
+            not isinstance(module, LayerNorm2d),
+            alpha_init_value=alpha_init_value,
+        )
     for name, child in module.named_children():
-        module_output.add_module(name, convert_ln_to_dyt(child))
+        module_output.add_module(name, convert_ln_to_dyt(child, alpha_init_value=alpha_init_value))
     del module
     return module_output
 

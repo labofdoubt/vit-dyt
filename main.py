@@ -203,6 +203,8 @@ def get_args_parser():
                         help="Save model checkpoints as W&B Artifacts.")
     
     parser.add_argument('--dynamic_tanh', type=str2bool, default=False)
+    parser.add_argument('--dyt_alpha_init_value', type=float, default=0.5,
+                        help='Initial value for DyT alpha (only used when --dynamic_tanh true).')
 
     return parser
 
@@ -301,7 +303,7 @@ def main(args):
         raise ValueError(f"Unrecognized model: {args.model}")
 
     if args.dynamic_tanh:
-        model = convert_ln_to_dyt(model)
+        model = convert_ln_to_dyt(model, alpha_init_value=args.dyt_alpha_init_value)
 
     if args.finetune:
         if args.finetune.startswith('https'):
