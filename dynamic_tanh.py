@@ -42,7 +42,8 @@ class Weird(nn.Module):
         self.normalized_shape = normalized_shape
         self.channels_last = channels_last
         self.alpha = float(alpha)
-        self.c = 0.5 - self.alpha
+        # self.c = 0.5 - self.alpha
+        self.c = 1.0
 
         # Match LayerNorm-style affine parameters used by DynamicTanh in this repo
         self.weight = nn.Parameter(torch.ones(normalized_shape))
@@ -51,7 +52,7 @@ class Weird(nn.Module):
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         ax = x.abs()
         y = torch.where(
-            ax < 0.3,
+            ax < 1.0,
             x,
             x.sign() * ax.pow(self.alpha),
         )
