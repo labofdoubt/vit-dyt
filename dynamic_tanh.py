@@ -28,9 +28,9 @@ class DynamicTanh(nn.Module):
 
 class Weird(nn.Module):
     """
-    Weird(x) = c * |x|                        if |x| < 1
-              c * |x|^alpha                   if |x| >= 1
-    where c = (1/2 - alpha) and alpha in (0, 1/2).
+    Weird(x) = x                                   if |x| < 1
+              sign(x) * |c * x|^alpha               if |x| >= 1
+    where alpha in (0, 1/2) and c = (1/2 - alpha).
     alpha is NOT learnable.
     """
 
@@ -43,7 +43,6 @@ class Weird(nn.Module):
         self.channels_last = channels_last
         self.alpha = float(alpha)
         self.c = 0.5 - self.alpha
-        self.c = 1
 
         # Match LayerNorm-style affine parameters used by DynamicTanh in this repo
         self.weight = nn.Parameter(torch.ones(normalized_shape))
@@ -51,7 +50,11 @@ class Weird(nn.Module):
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         ax = x.abs()
-        y = torch.where(ax < 1, ax, ax.pow(self.alpha))
+        y = torch.where(
+            ax < 1,
+            x,
+            x.sign() * ax.pow(self.alpha),
+        )
         y = y * self.c
 
         if self.channels_last:
