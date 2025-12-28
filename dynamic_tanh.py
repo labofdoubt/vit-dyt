@@ -51,7 +51,7 @@ class Weird(nn.Module):
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         ax = x.abs()
         y = torch.where(
-            ax < 1,
+            ax < 0.3,
             x,
             x.sign() * ax.pow(self.alpha),
         )
