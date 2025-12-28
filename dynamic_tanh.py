@@ -43,6 +43,7 @@ class Weird(nn.Module):
         self.channels_last = channels_last
         self.alpha = float(alpha)
         self.c = 0.5 - self.alpha
+        self.c = 1
 
         # Match LayerNorm-style affine parameters used by DynamicTanh in this repo
         self.weight = nn.Parameter(torch.ones(normalized_shape))
