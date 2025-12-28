@@ -50,12 +50,7 @@ class Weird(nn.Module):
         self.bias = nn.Parameter(torch.zeros(normalized_shape))
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        ax = x.abs()
-        y = torch.where(
-            ax < 1.0,
-            x,
-            x.sign() * ax.pow(self.alpha),
-        )
+        y = x * (1+x**2)**((self.alpha-1)/2)
         y = y * self.c
 
         if self.channels_last:
