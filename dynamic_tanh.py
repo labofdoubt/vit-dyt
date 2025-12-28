@@ -26,12 +26,10 @@ class DynamicTanh(nn.Module):
         return f"normalized_shape={self.normalized_shape}, alpha_init_value={self.alpha_init_value}, channels_last={self.channels_last}"
 
 
-class Weird(nn.Module):
+class UnboundedAct(nn.Module):
     """
-    Weird(x) = x                                   if |x| < 1
-              sign(x) * |c * x|^alpha               if |x| >= 1
-    where alpha in (0, 1/2) and c = (1/2 - alpha).
-    alpha is NOT learnable.
+    UnboundedAct(x) = x * (1+x**2)**((alpha-1)/2)
+    where alpha is NOT learnable.
     """
 
     def __init__(self, normalized_shape, channels_last, alpha: float):
@@ -42,7 +40,6 @@ class Weird(nn.Module):
         self.normalized_shape = normalized_shape
         self.channels_last = channels_last
         self.alpha = float(alpha)
-        # self.c = 0.5 - self.alpha
         self.c = 1.0
 
         # Match LayerNorm-style affine parameters used by DynamicTanh in this repo
@@ -81,21 +78,21 @@ def convert_ln_to_dyt(module, alpha_init_value=0.5):
     return module_output
 
 
-def convert_ln_to_weird(module, alpha: float):
+def convert_ln_to_unbounded_act(module, alpha: float):
     """
-    Recursively replace nn.LayerNorm modules with Weird modules.
+    Recursively replace nn.LayerNorm modules with UnboundedAct modules.
 
     alpha is a fixed (non-learnable) scalar in (0, 0.5).
     """
     module_output = module
     if isinstance(module, nn.LayerNorm):
-        module_output = Weird(
+        module_output = UnboundedAct(
             module.normalized_shape,
             not isinstance(module, LayerNorm2d),
             alpha=alpha,
         )
     for name, child in module.named_children():
-        module_output.add_module(name, convert_ln_to_weird(child, alpha=alpha))
+        module_output.add_module(name, convert_ln_to_unbounded_act(child, alpha=alpha))
     del module
     return module_output
 
