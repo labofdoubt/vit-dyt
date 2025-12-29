@@ -34,8 +34,8 @@ class UnboundedAct(nn.Module):
 
     def __init__(self, normalized_shape, channels_last, alpha: float):
         super().__init__()
-        if not (0.0 < float(alpha) < 0.5):
-            raise ValueError(f"alpha must be in (0, 0.5), got {alpha}")
+        if not (0.0 < float(alpha) < 1.0):
+            raise ValueError(f"alpha must be in (0, 1.0), got {alpha}")
 
         self.normalized_shape = normalized_shape
         self.channels_last = channels_last
