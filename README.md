@@ -1,3 +1,5 @@
+# fork
+
 # [Transformers without Normalization](https://arxiv.org/abs/2503.10622)
 
 Official PyTorch implementation of **DynamicTanh (DyT)**, from the following paper:
