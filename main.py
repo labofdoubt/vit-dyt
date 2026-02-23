@@ -218,6 +218,10 @@ def get_args_parser():
                         help='If true, save checkpoint-best when validation acc improves.')
     parser.add_argument('--save_best_ema_ckpt', type=str2bool, default=True,
                         help='If true, save checkpoint-best-ema when EMA validation acc improves.')
+    parser.add_argument('--early_stopping', type=str2bool, default=False,
+                        help='If true, stop training when top-1 validation accuracy does not improve for a patience window.')
+    parser.add_argument('--early_stopping_patience', type=int, default=10,
+                        help='Number of consecutive epochs without top-1 validation accuracy improvements before early stopping. Only used when --early_stopping true.')
 
     return parser
 
@@ -285,6 +289,12 @@ def main(args):
         )
     else:
         data_loader_val = None
+
+    if args.early_stopping:
+        if args.early_stopping_patience < 1:
+            raise ValueError("--early_stopping_patience must be >= 1")
+        if data_loader_val is None:
+            raise ValueError("Early stopping requires validation data; disable --early_stopping or enable evaluation.")
 
     mixup_fn = None
     mixup_active = args.mixup > 0 or args.cutmix > 0. or args.cutmix_minmax is not None
@@ -438,6 +448,8 @@ def main(args):
         return
 
     max_accuracy = 0.0
+    best_accuracy_epoch = args.start_epoch - 1
+    epochs_since_improvement = 0
     if args.model_ema and args.model_ema_eval:
         max_accuracy_ema = 0.0
 
@@ -450,6 +462,7 @@ def main(args):
             log_writer.set_step(epoch * num_training_steps_per_epoch * args.update_freq)
         if wandb_logger:
             wandb_logger.set_steps()
+        improved_this_epoch = False
         train_stats = train_one_epoch(
             model, criterion, data_loader_train, optimizer,
             device, epoch, loss_scaler, args.clip_grad, model_ema, mixup_fn,
@@ -468,6 +481,8 @@ def main(args):
             print(f"Accuracy of the model on the {len(dataset_val)} test images: {test_stats['acc1']:.1f}%")
             if max_accuracy < test_stats["acc1"]:
                 max_accuracy = test_stats["acc1"]
+                best_accuracy_epoch = epoch
+                improved_this_epoch = True
                 if args.output_dir and args.save_ckpt and args.save_best_ckpt:
                     utils.save_model(
                         args=args, model=model, model_without_ddp=model_without_ddp, optimizer=optimizer,
@@ -511,6 +526,20 @@ def main(args):
 
         if wandb_logger:
             wandb_logger.log_epoch_metrics(log_stats)
+
+        if args.early_stopping and data_loader_val is not None:
+            if improved_this_epoch:
+                epochs_since_improvement = 0
+            else:
+                epochs_since_improvement += 1
+            if epochs_since_improvement >= args.early_stopping_patience:
+                best_epoch_display = best_accuracy_epoch if best_accuracy_epoch >= 0 else "N/A"
+                print(
+                    f"Early stopping triggered: no validation top-1 accuracy improvement for "
+                    f"{args.early_stopping_patience} consecutive epochs. "
+                    f"Best accuracy {max_accuracy:.2f}% at epoch {best_epoch_display}."
+                )
+                break
 
     if wandb_logger and args.wandb_ckpt and args.save_ckpt and args.output_dir:
         wandb_logger.log_checkpoints()
