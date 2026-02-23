@@ -32,7 +32,7 @@ from engine import train_one_epoch, evaluate
 from utils import NativeScalerWithGradNormCount as NativeScaler
 import utils
 
-from dynamic_tanh import convert_ln_to_dyt, convert_ln_to_unbounded_act
+from dynamic_tanh import convert_ln_to_dyt, convert_ln_to_derf, convert_ln_to_unbounded_act
 
 
 def str2bool(v):
@@ -205,6 +205,9 @@ def get_args_parser():
     parser.add_argument('--dynamic_tanh', type=str2bool, default=False)
     parser.add_argument('--dyt_alpha_init_value', type=float, default=0.5,
                         help='Initial value for DyT alpha (only used when --dynamic_tanh true).')
+    parser.add_argument('--dynamic_erf', type=str2bool, default=False)
+    parser.add_argument('--derf_alpha_init_value', type=float, default=0.5,
+                        help='Initial value for Derf alpha (only used when --dynamic_erf true).')
     parser.add_argument('--unbounded_act', type=str2bool, default=False,
                         help='If true, replace LayerNorm layers with UnboundedAct.')
     parser.add_argument('--unbounded_act_alpha', type=float, default=0.25,
@@ -312,10 +315,17 @@ def main(args):
     else:
         raise ValueError(f"Unrecognized model: {args.model}")
 
-    if args.dynamic_tanh and args.unbounded_act:
-        raise ValueError("Choose only one: --dynamic_tanh or --unbounded_act")
+    activation_overrides = [
+        args.dynamic_tanh,
+        args.dynamic_erf,
+        args.unbounded_act,
+    ]
+    if sum(activation_overrides) > 1:
+        raise ValueError("Choose only one of --dynamic_tanh, --dynamic_erf, or --unbounded_act")
     if args.dynamic_tanh:
         model = convert_ln_to_dyt(model, alpha_init_value=args.dyt_alpha_init_value)
+    if args.dynamic_erf:
+        model = convert_ln_to_derf(model, alpha_init_value=args.derf_alpha_init_value)
     if args.unbounded_act:
         model = convert_ln_to_unbounded_act(model, alpha=args.unbounded_act_alpha)
 
