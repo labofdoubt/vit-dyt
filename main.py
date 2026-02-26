@@ -208,6 +208,8 @@ def get_args_parser():
     parser.add_argument('--dynamic_erf', type=str2bool, default=False)
     parser.add_argument('--derf_alpha_init_value', type=float, default=0.5,
                         help='Initial value for Derf alpha (only used when --dynamic_erf true).')
+    parser.add_argument('--derf_freeze_alpha', type=str2bool, default=False,
+                        help='If true, keep DynamicErf alpha fixed at its initialization value.')
     parser.add_argument('--unbounded_act', type=str2bool, default=False,
                         help='If true, replace LayerNorm layers with UnboundedAct.')
     parser.add_argument('--unbounded_act_alpha', type=float, default=0.25,
@@ -335,7 +337,11 @@ def main(args):
     if args.dynamic_tanh:
         model = convert_ln_to_dyt(model, alpha_init_value=args.dyt_alpha_init_value)
     if args.dynamic_erf:
-        model = convert_ln_to_derf(model, alpha_init_value=args.derf_alpha_init_value)
+        model = convert_ln_to_derf(
+            model,
+            alpha_init_value=args.derf_alpha_init_value,
+            freeze_alpha=args.derf_freeze_alpha,
+        )
     if args.unbounded_act:
         model = convert_ln_to_unbounded_act(model, alpha=args.unbounded_act_alpha)
 

@@ -107,7 +107,7 @@ def convert_ln_to_dyt(module, alpha_init_value=0.5):
     return module_output
 
 
-def convert_ln_to_derf(module, alpha_init_value=0.5):
+def convert_ln_to_derf(module, alpha_init_value=0.5, freeze_alpha=False):
     """
     Recursively replace nn.LayerNorm modules with DynamicErf modules.
     """
@@ -118,8 +118,9 @@ def convert_ln_to_derf(module, alpha_init_value=0.5):
             not isinstance(module, LayerNorm2d),
             alpha_init_value=alpha_init_value,
         )
+        module_output.alpha.requires_grad_(not freeze_alpha)
     for name, child in module.named_children():
-        module_output.add_module(name, convert_ln_to_derf(child, alpha_init_value=alpha_init_value))
+        module_output.add_module(name, convert_ln_to_derf(child, alpha_init_value=alpha_init_value, freeze_alpha=freeze_alpha))
     del module
     return module_output
 
@@ -141,4 +142,3 @@ def convert_ln_to_unbounded_act(module, alpha: float):
         module_output.add_module(name, convert_ln_to_unbounded_act(child, alpha=alpha))
     del module
     return module_output
-
