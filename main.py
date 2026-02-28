@@ -64,6 +64,12 @@ def get_args_parser():
                         help='Drop path rate (default: 0.0)')
     parser.add_argument('--input_size', default=224, type=int,
                         help='image input size')
+    parser.add_argument('--model_depth', default=None, type=int,
+                        help='Optional override for model depth (number of transformer blocks) when supported by the chosen model. '
+                             'For ViT architectures this maps to the depth argument in timm.create_model.')
+    parser.add_argument('--model_depth', default=None, type=int,
+                        help='Optional override for model depth (number of transformer blocks) when supported by the chosen model. '
+                             'For ViT architectures this maps to the depth argument in timm.create_model.')
     parser.add_argument('--layer_scale_init_value', default=1e-6, type=float,
                         help="Layer scale initial values")
 
@@ -317,12 +323,16 @@ def main(args):
             head_init_scale=args.head_init_scale,
         )
     elif "vit" in args.model:
+        extra_model_kwargs = {}
+        if args.model_depth is not None:
+            extra_model_kwargs['depth'] = args.model_depth
         model = create_model(
             args.model,
             pretrained=False,
             num_classes=args.nb_classes,
             global_pool='avg',
             drop_path_rate=args.drop_path,
+            **extra_model_kwargs,
         )
     else:
         raise ValueError(f"Unrecognized model: {args.model}")
