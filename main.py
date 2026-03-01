@@ -49,6 +49,38 @@ def str2bool(v):
     else:
         raise argparse.ArgumentTypeError('Boolean value expected.')
 
+
+class ResidualBranchScale(nn.Module):
+    """
+    Simple non-trainable multiplier used to rescale ViT residual branches.
+    """
+
+    def __init__(self, scale: float):
+        super().__init__()
+        self.register_buffer("_scale", torch.tensor(float(scale)), persistent=False)
+
+    def forward(self, x):
+        return x * self._scale
+
+
+def apply_residual_branch_scale_vit(model: nn.Module, scale: float):
+    """
+    Attach a ResidualBranchScale module after each ViT block's drop_path so that the
+    residual contribution is multiplied by `scale` before being added.
+    """
+    if not hasattr(model, "blocks"):
+        raise ValueError("Residual branch scaling currently supports ViT models with a `blocks` attribute.")
+
+    for block in model.blocks:
+        for attr in ("drop_path1", "drop_path2"):
+            module = getattr(block, attr, None)
+            if module is None:
+                continue
+            if any(isinstance(child, ResidualBranchScale) for child in module.modules()):
+                continue  # avoid double-wrapping
+            wrapped = nn.Sequential(module, ResidualBranchScale(scale))
+            setattr(block, attr, wrapped)
+
 def get_args_parser():
     parser = argparse.ArgumentParser('ConvNeXt training and evaluation script for image classification', add_help=False)
     parser.add_argument('--batch_size', default=64, type=int,
@@ -67,6 +99,10 @@ def get_args_parser():
     parser.add_argument('--model_depth', default=None, type=int,
                         help='Optional override for model depth (number of transformer blocks) when supported by the chosen model. '
                              'For ViT architectures this maps to the depth argument in timm.create_model.')
+    parser.add_argument('--use_residual_branch_scale', type=str2bool, default=False,
+                        help='If true, multiply each ViT residual branch (attention and MLP path) by a fixed coefficient.')
+    parser.add_argument('--residual_branch_scale_coef', type=float, default=None,
+                        help='Non-trainable multiplier applied to every ViT residual branch when --use_residual_branch_scale is true.')
     parser.add_argument('--layer_scale_init_value', default=1e-6, type=float,
                         help="Layer scale initial values")
 
@@ -351,6 +387,12 @@ def main(args):
         )
     if args.unbounded_act:
         model = convert_ln_to_unbounded_act(model, alpha=args.unbounded_act_alpha)
+    if args.use_residual_branch_scale:
+        if args.residual_branch_scale_coef is None:
+            raise ValueError("--residual_branch_scale_coef must be set when --use_residual_branch_scale is true.")
+        if "vit" not in args.model:
+            raise ValueError("--use_residual_branch_scale currently supports ViT models only.")
+        apply_residual_branch_scale_vit(model, scale=args.residual_branch_scale_coef)
 
     if args.finetune:
         if args.finetune.startswith('https'):
