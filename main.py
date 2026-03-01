@@ -67,9 +67,6 @@ def get_args_parser():
     parser.add_argument('--model_depth', default=None, type=int,
                         help='Optional override for model depth (number of transformer blocks) when supported by the chosen model. '
                              'For ViT architectures this maps to the depth argument in timm.create_model.')
-    parser.add_argument('--model_depth', default=None, type=int,
-                        help='Optional override for model depth (number of transformer blocks) when supported by the chosen model. '
-                             'For ViT architectures this maps to the depth argument in timm.create_model.')
     parser.add_argument('--layer_scale_init_value', default=1e-6, type=float,
                         help="Layer scale initial values")
 
