@@ -81,6 +81,26 @@ def apply_residual_branch_scale_vit(model: nn.Module, scale: float):
             wrapped = nn.Sequential(module, ResidualBranchScale(scale))
             setattr(block, attr, wrapped)
 
+
+def scale_vit_mlp_init_std(model: nn.Module, multiplier: float):
+    """
+    Multiply the weights of each ViT block's MLP fc1/fc2 layers by `multiplier`.
+    """
+    if multiplier <= 0:
+        raise ValueError("MLP init std multiplier must be positive.")
+    if not hasattr(model, "blocks"):
+        raise ValueError("MLP init std scaling currently supports ViT models with a `blocks` attribute.")
+
+    with torch.no_grad():
+        for block in model.blocks:
+            mlp = getattr(block, "mlp", None)
+            if mlp is None:
+                continue
+            for attr in ("fc1", "fc2"):
+                layer = getattr(mlp, attr, None)
+                if isinstance(layer, nn.Linear):
+                    layer.weight.mul_(multiplier)
+
 def get_args_parser():
     parser = argparse.ArgumentParser('ConvNeXt training and evaluation script for image classification', add_help=False)
     parser.add_argument('--batch_size', default=64, type=int,
@@ -103,6 +123,10 @@ def get_args_parser():
                         help='If true, multiply each ViT residual branch (attention and MLP path) by a fixed coefficient.')
     parser.add_argument('--residual_branch_scale_coef', type=float, default=None,
                         help='Non-trainable multiplier applied to every ViT residual branch when --use_residual_branch_scale is true.')
+    parser.add_argument('--use_mlp_init_std_multiplier', type=str2bool, default=False,
+                        help='If true, multiply ViT MLP fc1/fc2 weight std by a fixed coefficient right after initialization.')
+    parser.add_argument('--mlp_init_std_multiplier', type=float, default=None,
+                        help='Scaling coefficient applied to ViT MLP fc1/fc2 weights when --use_mlp_init_std_multiplier is true.')
     parser.add_argument('--layer_scale_init_value', default=1e-6, type=float,
                         help="Layer scale initial values")
 
@@ -393,6 +417,12 @@ def main(args):
         if "vit" not in args.model:
             raise ValueError("--use_residual_branch_scale currently supports ViT models only.")
         apply_residual_branch_scale_vit(model, scale=args.residual_branch_scale_coef)
+    if args.use_mlp_init_std_multiplier:
+        if args.mlp_init_std_multiplier is None:
+            raise ValueError("--mlp_init_std_multiplier must be set when --use_mlp_init_std_multiplier is true.")
+        if "vit" not in args.model:
+            raise ValueError("--use_mlp_init_std_multiplier currently supports ViT models only.")
+        scale_vit_mlp_init_std(model, multiplier=args.mlp_init_std_multiplier)
 
     if args.finetune:
         if args.finetune.startswith('https'):
