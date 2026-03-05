@@ -101,6 +101,33 @@ def scale_vit_mlp_init_std(model: nn.Module, multiplier: float):
                 if isinstance(layer, nn.Linear):
                     layer.weight.mul_(multiplier)
 
+
+def scale_vit_attn_value_and_proj(model: nn.Module, multiplier: float):
+    """
+    Multiply the attention value projection (within qkv) and output projection weights/biases by `multiplier`.
+    """
+    if multiplier <= 0:
+        raise ValueError("Attention init std multiplier must be positive.")
+    if not hasattr(model, "blocks"):
+        raise ValueError("Attention init std scaling currently supports ViT models with a `blocks` attribute.")
+
+    with torch.no_grad():
+        for block in model.blocks:
+            attn = getattr(block, "attn", None)
+            if attn is None:
+                continue
+            qkv = getattr(attn, "qkv", None)
+            proj = getattr(attn, "proj", None)
+            if isinstance(qkv, nn.Linear):
+                dim = qkv.weight.shape[0] // 3
+                qkv.weight[2 * dim:] *= multiplier
+                if qkv.bias is not None:
+                    qkv.bias[2 * dim:] *= multiplier
+            if isinstance(proj, nn.Linear):
+                proj.weight.mul_(multiplier)
+                if proj.bias is not None:
+                    proj.bias.mul_(multiplier)
+
 def get_args_parser():
     parser = argparse.ArgumentParser('ConvNeXt training and evaluation script for image classification', add_help=False)
     parser.add_argument('--batch_size', default=64, type=int,
@@ -127,6 +154,10 @@ def get_args_parser():
                         help='If true, multiply ViT MLP fc1/fc2 weight std by a fixed coefficient right after initialization.')
     parser.add_argument('--mlp_init_std_multiplier', type=float, default=None,
                         help='Scaling coefficient applied to ViT MLP fc1/fc2 weights when --use_mlp_init_std_multiplier is true.')
+    parser.add_argument('--use_attn_value_init_std_multiplier', type=str2bool, default=False,
+                        help='If true, rescale the attention value/projection weights at initialization.')
+    parser.add_argument('--attn_value_init_std_multiplier', type=float, default=None,
+                        help='Scaling coefficient applied to attention value and output projection weights when --use_attn_value_init_std_multiplier is true.')
     parser.add_argument('--layer_scale_init_value', default=1e-6, type=float,
                         help="Layer scale initial values")
 
@@ -423,6 +454,12 @@ def main(args):
         if "vit" not in args.model:
             raise ValueError("--use_mlp_init_std_multiplier currently supports ViT models only.")
         scale_vit_mlp_init_std(model, multiplier=args.mlp_init_std_multiplier)
+    if args.use_attn_value_init_std_multiplier:
+        if args.attn_value_init_std_multiplier is None:
+            raise ValueError("--attn_value_init_std_multiplier must be set when --use_attn_value_init_std_multiplier is true.")
+        if "vit" not in args.model:
+            raise ValueError("--use_attn_value_init_std_multiplier currently supports ViT models only.")
+        scale_vit_attn_value_and_proj(model, multiplier=args.attn_value_init_std_multiplier)
 
     if args.finetune:
         if args.finetune.startswith('https'):
