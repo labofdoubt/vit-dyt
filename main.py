@@ -32,7 +32,14 @@ from engine import train_one_epoch, evaluate
 from utils import NativeScalerWithGradNormCount as NativeScaler
 import utils
 
-from dynamic_tanh import convert_ln_to_dyt, convert_ln_to_derf, convert_ln_to_unbounded_act
+from dynamic_tanh import (
+    DynamicErf,
+    DynamicTanh,
+    UnboundedAct,
+    convert_ln_to_derf,
+    convert_ln_to_dyt,
+    convert_ln_to_unbounded_act,
+)
 
 
 def str2bool(v):
@@ -128,6 +135,35 @@ def scale_vit_attn_value_and_proj(model: nn.Module, multiplier: float):
                 if proj.bias is not None:
                     proj.bias.mul_(multiplier)
 
+
+def add_vit_pre_layernorm(model: nn.Module):
+    """
+    Replace ViT `norm_pre` with a LayerNorm so tokens are normalized before block 0.
+    """
+    if not hasattr(model, "norm_pre"):
+        raise ValueError("Pre-block LayerNorm currently supports ViT models with a `norm_pre` attribute.")
+    if not hasattr(model, "num_features"):
+        raise ValueError("Unable to infer embedding dimension for ViT pre-block LayerNorm.")
+
+    model.norm_pre = nn.LayerNorm(model.num_features)
+
+
+def set_vit_block_norm_gamma_init(model: nn.Module, value: float):
+    """
+    Set the affine weight for normalization modules inside transformer blocks only.
+    This excludes `norm_pre` and any final head/fc normalization layers because the
+    traversal is restricted to `model.blocks`.
+    """
+    if not hasattr(model, "blocks"):
+        raise ValueError("Block norm gamma initialization currently supports ViT models with a `blocks` attribute.")
+
+    norm_types = (nn.LayerNorm, DynamicTanh, DynamicErf, UnboundedAct)
+    with torch.no_grad():
+        for block in model.blocks:
+            for module in block.modules():
+                if isinstance(module, norm_types) and getattr(module, "weight", None) is not None:
+                    module.weight.fill_(value)
+
 def get_args_parser():
     parser = argparse.ArgumentParser('ConvNeXt training and evaluation script for image classification', add_help=False)
     parser.add_argument('--batch_size', default=64, type=int,
@@ -158,6 +194,10 @@ def get_args_parser():
                         help='If true, rescale the attention value/projection weights at initialization.')
     parser.add_argument('--attn_value_init_std_multiplier', type=float, default=None,
                         help='Scaling coefficient applied to attention value and output projection weights when --use_attn_value_init_std_multiplier is true.')
+    parser.add_argument('--add_pre_block_layernorm', type=str2bool, default=False,
+                        help='If true, replace ViT norm_pre with a LayerNorm so the input is normalized before transformer block 0.')
+    parser.add_argument('--block_layernorm_gamma_init_value', type=float, default=None,
+                        help='If set, initialize the affine weight of normalization layers inside ViT transformer blocks to this value. Excludes norm_pre and fc_norm.')
     parser.add_argument('--layer_scale_init_value', default=1e-6, type=float,
                         help="Layer scale initial values")
 
@@ -425,6 +465,11 @@ def main(args):
     else:
         raise ValueError(f"Unrecognized model: {args.model}")
 
+    if args.add_pre_block_layernorm:
+        if "vit" not in args.model:
+            raise ValueError("--add_pre_block_layernorm currently supports ViT models only.")
+        add_vit_pre_layernorm(model)
+
     activation_overrides = [
         args.dynamic_tanh,
         args.dynamic_erf,
@@ -442,6 +487,10 @@ def main(args):
         )
     if args.unbounded_act:
         model = convert_ln_to_unbounded_act(model, alpha=args.unbounded_act_alpha)
+    if args.block_layernorm_gamma_init_value is not None:
+        if "vit" not in args.model:
+            raise ValueError("--block_layernorm_gamma_init_value currently supports ViT models only.")
+        set_vit_block_norm_gamma_init(model, value=args.block_layernorm_gamma_init_value)
     if args.use_residual_branch_scale:
         if args.residual_branch_scale_coef is None:
             raise ValueError("--residual_branch_scale_coef must be set when --use_residual_branch_scale is true.")
