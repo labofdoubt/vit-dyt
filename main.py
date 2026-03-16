@@ -70,6 +70,19 @@ class ResidualBranchScale(nn.Module):
         return x * self._scale
 
 
+class LearnableResidualBranchScale(nn.Module):
+    """
+    Learnable scalar multiplier used to rescale a single ViT residual branch.
+    """
+
+    def __init__(self, init_value: float):
+        super().__init__()
+        self.scale = nn.Parameter(torch.tensor(float(init_value)))
+
+    def forward(self, x):
+        return x * self.scale
+
+
 def apply_residual_branch_scale_vit(model: nn.Module, scale: float):
     """
     Attach a ResidualBranchScale module after each ViT block's drop_path so that the
@@ -86,6 +99,25 @@ def apply_residual_branch_scale_vit(model: nn.Module, scale: float):
             if any(isinstance(child, ResidualBranchScale) for child in module.modules()):
                 continue  # avoid double-wrapping
             wrapped = nn.Sequential(module, ResidualBranchScale(scale))
+            setattr(block, attr, wrapped)
+
+
+def apply_learnable_residual_branch_scale_vit(model: nn.Module, init_value: float):
+    """
+    Attach a learnable scalar after each ViT block's drop_path so each residual
+    branch gets its own trainable multiplier before being added back.
+    """
+    if not hasattr(model, "blocks"):
+        raise ValueError("Learnable residual branch scaling currently supports ViT models with a `blocks` attribute.")
+
+    for block in model.blocks:
+        for attr in ("drop_path1", "drop_path2"):
+            module = getattr(block, attr, None)
+            if module is None:
+                continue
+            if any(isinstance(child, (ResidualBranchScale, LearnableResidualBranchScale)) for child in module.modules()):
+                continue
+            wrapped = nn.Sequential(module, LearnableResidualBranchScale(init_value))
             setattr(block, attr, wrapped)
 
 
@@ -202,6 +234,10 @@ def get_args_parser():
                         help='If true, multiply each ViT residual branch (attention and MLP path) by a fixed coefficient.')
     parser.add_argument('--residual_branch_scale_coef', type=float, default=None,
                         help='Non-trainable multiplier applied to every ViT residual branch when --use_residual_branch_scale is true.')
+    parser.add_argument('--use_learnable_residual_branch_scale', type=str2bool, default=False,
+                        help='If true, multiply each ViT residual branch by its own learnable scalar parameter.')
+    parser.add_argument('--learnable_residual_branch_scale_init_value', type=float, default=1.0,
+                        help='Initialization value for each learnable ViT residual-branch scale.')
     parser.add_argument('--use_mlp_init_std_multiplier', type=str2bool, default=False,
                         help='If true, multiply ViT MLP fc1/fc2 weight std by a fixed coefficient right after initialization.')
     parser.add_argument('--mlp_init_std_multiplier', type=float, default=None,
@@ -526,12 +562,21 @@ def main(args):
         if "vit" not in args.model:
             raise ValueError("--block_layernorm_gamma_init_value currently supports ViT models only.")
         set_vit_block_norm_gamma_init(model, value=args.block_layernorm_gamma_init_value)
+    if args.use_residual_branch_scale and args.use_learnable_residual_branch_scale:
+        raise ValueError("Choose only one of --use_residual_branch_scale or --use_learnable_residual_branch_scale")
     if args.use_residual_branch_scale:
         if args.residual_branch_scale_coef is None:
             raise ValueError("--residual_branch_scale_coef must be set when --use_residual_branch_scale is true.")
         if "vit" not in args.model:
             raise ValueError("--use_residual_branch_scale currently supports ViT models only.")
         apply_residual_branch_scale_vit(model, scale=args.residual_branch_scale_coef)
+    if args.use_learnable_residual_branch_scale:
+        if "vit" not in args.model:
+            raise ValueError("--use_learnable_residual_branch_scale currently supports ViT models only.")
+        apply_learnable_residual_branch_scale_vit(
+            model,
+            init_value=args.learnable_residual_branch_scale_init_value,
+        )
     if args.use_mlp_init_std_multiplier:
         if args.mlp_init_std_multiplier is None:
             raise ValueError("--mlp_init_std_multiplier must be set when --use_mlp_init_std_multiplier is true.")
