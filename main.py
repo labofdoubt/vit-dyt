@@ -344,6 +344,8 @@ def get_args_parser():
                         help='Initial value for Derf alpha (only used when --dynamic_erf true).')
     parser.add_argument('--derf_freeze_alpha', type=str2bool, default=False,
                         help='If true, keep DynamicErf alpha fixed at its initialization value.')
+    parser.add_argument('--final_ln_not_replaced', type=str2bool, default=False,
+                        help='If true, keep the final ViT LayerNorm (`norm` or `fc_norm`) as LayerNorm when using --dynamic_tanh or --dynamic_erf.')
     parser.add_argument('--unbounded_act', type=str2bool, default=False,
                         help='If true, replace LayerNorm layers with UnboundedAct.')
     parser.add_argument('--unbounded_act_alpha', type=float, default=0.25,
@@ -478,12 +480,17 @@ def main(args):
     if sum(activation_overrides) > 1:
         raise ValueError("Choose only one of --dynamic_tanh, --dynamic_erf, or --unbounded_act")
     if args.dynamic_tanh:
-        model = convert_ln_to_dyt(model, alpha_init_value=args.dyt_alpha_init_value)
+        model = convert_ln_to_dyt(
+            model,
+            alpha_init_value=args.dyt_alpha_init_value,
+            final_ln_not_replaced=args.final_ln_not_replaced,
+        )
     if args.dynamic_erf:
         model = convert_ln_to_derf(
             model,
             alpha_init_value=args.derf_alpha_init_value,
             freeze_alpha=args.derf_freeze_alpha,
+            final_ln_not_replaced=args.final_ln_not_replaced,
         )
     if args.unbounded_act:
         model = convert_ln_to_unbounded_act(model, alpha=args.unbounded_act_alpha)

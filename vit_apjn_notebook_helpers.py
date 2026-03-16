@@ -4320,22 +4320,40 @@ def _swarm_x_positions(n_points: int, center: float, width: float, rng: np.rando
     return center + offsets[order]
 
 
-def plot_fit_and_scatter_figure(
+def prepare_fit_and_scatter_plot_data(
     fit_bundle,
     inverse_scatter_bundle,
     direct_scatter_bundle,
+):
+    return {
+        "fit_bundle": _maybe_load_bundle(fit_bundle),
+        "inverse_scatter_bundle": _maybe_load_bundle(inverse_scatter_bundle),
+        "direct_scatter_bundle": _maybe_load_bundle(direct_scatter_bundle),
+    }
+
+
+def plot_fit_and_scatter_figure(
+    fit_scatter_plot_data,
     style_cfg: FinalThreePanelStyleConfig,
-    panel_gap_ab=0.18,
-    panel_gap_bc=0.18,
-    panel_gap_cd=0.18,
+    panel_col_gap=0.18,
+    panel_row_gap=0.22,
+    lower_row_to_colorbar_gap=0.18,
     tick_fs=None,
     label_fs=None,
     alpha_legend_fs=None,
     title_fs=None,
+    percentile_annotation_fs=None,
+    percentile_annotation_alpha=0.45,
+    scatter_point_alpha=0.55,
 ):
-    fit_bundle = _maybe_load_bundle(fit_bundle)
-    inverse_scatter_bundle = _maybe_load_bundle(inverse_scatter_bundle)
-    direct_scatter_bundle = _maybe_load_bundle(direct_scatter_bundle)
+    if not isinstance(fit_scatter_plot_data, dict) or "fit_bundle" not in fit_scatter_plot_data:
+        raise TypeError(
+            "plot_fit_and_scatter_figure expects the result of "
+            "prepare_fit_and_scatter_plot_data(...)."
+        )
+    fit_bundle = fit_scatter_plot_data["fit_bundle"]
+    inverse_scatter_bundle = fit_scatter_plot_data["inverse_scatter_bundle"]
+    direct_scatter_bundle = fit_scatter_plot_data["direct_scatter_bundle"]
     alphas = np.asarray(direct_scatter_bundle["alphas"], dtype=float)
     colors = _make_alpha_colors(alphas)
     alpha_to_color = {float(a): colors[i] for i, a in enumerate(alphas)}
@@ -4345,21 +4363,22 @@ def plot_fit_and_scatter_figure(
         label_fs=label_fs,
         alpha_legend_fs=alpha_legend_fs,
         title_fs=title_fs,
+        annotation_fs=percentile_annotation_fs,
     )
-    fig = plt.figure(figsize=(19.0, 4.8))
+    fig = plt.figure(figsize=(13.8, 13.8))
     gs = fig.add_gridspec(
-        2,
-        7,
-        height_ratios=[1.0, 0.18],
-        width_ratios=[1.0, panel_gap_ab, 1.0, panel_gap_bc, 1.0, panel_gap_cd, 1.0],
-        hspace=0.15,
+        5,
+        3,
+        height_ratios=[1.0, panel_row_gap, 1.0, lower_row_to_colorbar_gap, 0.18],
+        width_ratios=[1.0, panel_col_gap, 1.0],
+        hspace=0.0,
         wspace=0.0,
     )
     ax_a = fig.add_subplot(gs[0, 0])
     ax_b = fig.add_subplot(gs[0, 2])
-    ax_c = fig.add_subplot(gs[0, 4])
-    ax_d = fig.add_subplot(gs[0, 6])
-    cax = fig.add_subplot(gs[1, 6])
+    ax_c = fig.add_subplot(gs[2, 0])
+    ax_d = fig.add_subplot(gs[2, 2])
+    cax = fig.add_subplot(gs[4, :])
 
     rng_swarm = np.random.default_rng(0)
     inv_mape_pct = 100.0 * np.asarray(fit_bundle["inverse_mape"], dtype=float)
@@ -4367,24 +4386,50 @@ def plot_fit_and_scatter_figure(
     x_inv = _swarm_x_positions(inv_mape_pct.size, center=0.0, width=0.42, rng=rng_swarm)
     x_dir = _swarm_x_positions(dir_mape_pct.size, center=0.0, width=0.42, rng=rng_swarm)
     ax_a.scatter(x_inv, inv_mape_pct, color="#4c78a8", s=28, alpha=0.8, edgecolors="none")
-    ax_a.set_title("(a) backward-APJN-fit MAPE", fontsize=sizes["title_fs"])
+    ax_a.set_title(r"(a) Per-sample $\mathcal{J}^{\, B, b}$-fit MAPE", fontsize=sizes["title_fs"])
+    ax_a.set_ylabel(r"MAPE, $\%$", fontsize=sizes["label_fs"])
     ax_a.set_xticks([])
-    ax_a.set_ylabel("MAPE, %", fontsize=sizes["label_fs"])
     prettify_axes(ax_a)
     ax_a.tick_params(labelsize=sizes["tick_fs"])
+    for percentile, label in [(80, r"$80\%$ of data points"), (90, r"$90\%$ of data points")]:
+        y_val = float(np.nanpercentile(inv_mape_pct, percentile))
+        ax_a.axhline(y_val, color="#4c78a8", ls="--", lw=1.2, alpha=0.75)
+        ax_a.text(
+            0.98,
+            y_val,
+            label,
+            ha="right",
+            va="bottom",
+            transform=ax_a.get_yaxis_transform(),
+            fontsize=sizes["annotation_fs"],
+            alpha=float(percentile_annotation_alpha),
+        )
 
     ax_b.scatter(x_dir, dir_mape_pct, color="#2ca02c", s=28, alpha=0.8, edgecolors="none")
-    ax_b.set_title("(b) APJN-fit MAPE", fontsize=sizes["title_fs"])
+    ax_b.set_title(r"(b) Per-sample $\mathcal{J}^{\, b, 0}$-fit MAPE", fontsize=sizes["title_fs"])
+    ax_b.set_ylabel(r"MAPE, $\%$", fontsize=sizes["label_fs"])
     ax_b.set_xticks([])
-    ax_b.set_ylabel("MAPE, %", fontsize=sizes["label_fs"])
     prettify_axes(ax_b)
     ax_b.tick_params(labelsize=sizes["tick_fs"])
+    for percentile, label in [(80, r"$80\%$ of data points"), (90, r"$90\%$ of data points")]:
+        y_val = float(np.nanpercentile(dir_mape_pct, percentile))
+        ax_b.axhline(y_val, color="#2ca02c", ls="--", lw=1.2, alpha=0.75)
+        ax_b.text(
+            0.98,
+            y_val,
+            label,
+            ha="right",
+            va="bottom",
+            transform=ax_b.get_yaxis_transform(),
+            fontsize=sizes["annotation_fs"],
+            alpha=float(percentile_annotation_alpha),
+        )
 
     inverse_points = inverse_scatter_bundle.get("points", [])
     for point in inverse_points:
         color = "black" if point["model_kind"] == "preln" else alpha_to_color[float(point["alpha"])]
-        ax_c.scatter(point["layer"], point["value"], color=color, s=18, alpha=0.55)
-    ax_c.set_title("(c) backward APJN samples", fontsize=sizes["title_fs"])
+        ax_c.scatter(point["layer"], point["value"], color=color, s=18, alpha=float(scatter_point_alpha))
+    ax_c.set_title(r"(c) $\mathcal{J}^{\, B, b}$ across samples", fontsize=sizes["title_fs"])
     ax_c.set_xlabel(r"$b$", fontsize=sizes["label_fs"])
     ax_c.set_ylabel(r"$\mathcal{J}^{\, B, b}$", fontsize=sizes["label_fs"])
     ax_c.set_yscale("log")
@@ -4395,8 +4440,8 @@ def plot_fit_and_scatter_figure(
     direct_points = direct_scatter_bundle.get("points", [])
     for point in direct_points:
         color = "black" if point["model_kind"] == "preln" else alpha_to_color[float(point["alpha"])]
-        ax_d.scatter(point["layer"], point["value"], color=color, s=18, alpha=0.55)
-    ax_d.set_title("(d) direct APJN samples", fontsize=sizes["title_fs"])
+        ax_d.scatter(point["layer"], point["value"], color=color, s=18, alpha=float(scatter_point_alpha))
+    ax_d.set_title(r"(d) $\mathcal{J}^{\, b, 0}$ across samples", fontsize=sizes["title_fs"])
     ax_d.set_xlabel(r"$b$", fontsize=sizes["label_fs"])
     ax_d.set_ylabel(r"$\mathcal{J}^{\, b, 0}$", fontsize=sizes["label_fs"])
     ax_d.set_yscale("log")
@@ -4404,14 +4449,11 @@ def plot_fit_and_scatter_figure(
     prettify_axes(ax_d)
     ax_d.tick_params(labelsize=sizes["tick_fs"])
 
-    center_shrink_axis(cax, width_scale=0.95, height_scale=0.75)
+    center_shrink_axis(cax, width_scale=0.82, height_scale=0.75)
     if style_cfg.colorbar_pad:
         pos = cax.get_position()
         cax.set_position([pos.x0, pos.y0 - style_cfg.colorbar_pad, pos.width, pos.height])
-    add_alpha_colorbar_horizontal_single(cax, alphas, colors, label=r"$\alpha$ (Derf)", cb_fs=sizes["alpha_legend_fs"])
-    rect = mpatches.Rectangle((1.02, 0.05), 0.08, 0.9, transform=cax.transAxes, facecolor="black", edgecolor="black", clip_on=False)
-    cax.add_patch(rect)
-    cax.text(1.06, -0.2, "pre-LN", transform=cax.transAxes, ha="center", va="top", fontsize=sizes["alpha_legend_fs"])
+    _draw_alpha_preln_legend_like_equangular(cax, alphas, colors, sizes["alpha_legend_fs"])
     _save_notebook_figure(fig, "fit_and_scatter_figure.pdf")
     plt.show()
     return fig

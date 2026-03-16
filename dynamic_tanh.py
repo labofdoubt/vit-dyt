@@ -93,7 +93,7 @@ class UnboundedAct(nn.Module):
         )
 
 
-def convert_ln_to_dyt(module, alpha_init_value=0.5):
+def convert_ln_to_dyt(module, alpha_init_value=0.5, final_ln_not_replaced=False, is_root=True):
     module_output = module
     if isinstance(module, nn.LayerNorm):
         module_output = DynamicTanh(
@@ -102,12 +102,26 @@ def convert_ln_to_dyt(module, alpha_init_value=0.5):
             alpha_init_value=alpha_init_value,
         )
     for name, child in module.named_children():
-        module_output.add_module(name, convert_ln_to_dyt(child, alpha_init_value=alpha_init_value))
+        if name == "norm_pre" and isinstance(child, nn.LayerNorm):
+            module_output.add_module(name, child)
+            continue
+        if is_root and final_ln_not_replaced and name in {"norm", "fc_norm"} and isinstance(child, nn.LayerNorm):
+            module_output.add_module(name, child)
+            continue
+        module_output.add_module(
+            name,
+            convert_ln_to_dyt(
+                child,
+                alpha_init_value=alpha_init_value,
+                final_ln_not_replaced=final_ln_not_replaced,
+                is_root=False,
+            ),
+        )
     del module
     return module_output
 
 
-def convert_ln_to_derf(module, alpha_init_value=0.5, freeze_alpha=False):
+def convert_ln_to_derf(module, alpha_init_value=0.5, freeze_alpha=False, final_ln_not_replaced=False, is_root=True):
     """
     Recursively replace nn.LayerNorm modules with DynamicErf modules.
     """
@@ -120,7 +134,22 @@ def convert_ln_to_derf(module, alpha_init_value=0.5, freeze_alpha=False):
         )
         module_output.alpha.requires_grad_(not freeze_alpha)
     for name, child in module.named_children():
-        module_output.add_module(name, convert_ln_to_derf(child, alpha_init_value=alpha_init_value, freeze_alpha=freeze_alpha))
+        if name == "norm_pre" and isinstance(child, nn.LayerNorm):
+            module_output.add_module(name, child)
+            continue
+        if is_root and final_ln_not_replaced and name in {"norm", "fc_norm"} and isinstance(child, nn.LayerNorm):
+            module_output.add_module(name, child)
+            continue
+        module_output.add_module(
+            name,
+            convert_ln_to_derf(
+                child,
+                alpha_init_value=alpha_init_value,
+                freeze_alpha=freeze_alpha,
+                final_ln_not_replaced=final_ln_not_replaced,
+                is_root=False,
+            ),
+        )
     del module
     return module_output
 
