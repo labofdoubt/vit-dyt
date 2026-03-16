@@ -83,6 +83,19 @@ class LearnableResidualBranchScale(nn.Module):
         return x * self.scale
 
 
+class LearnablePostNormScale(nn.Module):
+    """
+    Learnable scalar multiplier applied immediately after a normalization module.
+    """
+
+    def __init__(self, init_value: float):
+        super().__init__()
+        self.scale = nn.Parameter(torch.tensor(float(init_value)))
+
+    def forward(self, x):
+        return x * self.scale
+
+
 def apply_residual_branch_scale_vit(model: nn.Module, scale: float):
     """
     Attach a ResidualBranchScale module after each ViT block's drop_path so that the
@@ -119,6 +132,24 @@ def apply_learnable_residual_branch_scale_vit(model: nn.Module, init_value: floa
                 continue
             wrapped = nn.Sequential(module, LearnableResidualBranchScale(init_value))
             setattr(block, attr, wrapped)
+
+
+def apply_learnable_post_norm_scale_vit(model: nn.Module, init_value: float):
+    """
+    Wrap each ViT normalization module so its output is multiplied by a learnable scalar.
+    """
+    norm_types = (nn.LayerNorm, DynamicTanh, DynamicErf, UnboundedAct)
+
+    def _wrap(module: nn.Module):
+        for name, child in list(module.named_children()):
+            if isinstance(child, nn.Sequential) and any(isinstance(grandchild, LearnablePostNormScale) for grandchild in child.children()):
+                continue
+            if isinstance(child, norm_types):
+                module.add_module(name, nn.Sequential(child, LearnablePostNormScale(init_value)))
+                continue
+            _wrap(child)
+
+    _wrap(model)
 
 
 def scale_vit_mlp_init_std(model: nn.Module, multiplier: float):
@@ -238,6 +269,10 @@ def get_args_parser():
                         help='If true, multiply each ViT residual branch by its own learnable scalar parameter.')
     parser.add_argument('--learnable_residual_branch_scale_init_value', type=float, default=1.0,
                         help='Initialization value for each learnable ViT residual-branch scale.')
+    parser.add_argument('--use_learnable_post_layernorm_scale', type=str2bool, default=False,
+                        help='If true, multiply the output of each ViT normalization module by a learnable scalar parameter.')
+    parser.add_argument('--learnable_post_layernorm_scale_init_value', type=float, default=1.0,
+                        help='Initialization value for each learnable post-layernorm scale.')
     parser.add_argument('--use_mlp_init_std_multiplier', type=str2bool, default=False,
                         help='If true, multiply ViT MLP fc1/fc2 weight std by a fixed coefficient right after initialization.')
     parser.add_argument('--mlp_init_std_multiplier', type=float, default=None,
@@ -562,6 +597,13 @@ def main(args):
         if "vit" not in args.model:
             raise ValueError("--block_layernorm_gamma_init_value currently supports ViT models only.")
         set_vit_block_norm_gamma_init(model, value=args.block_layernorm_gamma_init_value)
+    if args.use_learnable_post_layernorm_scale:
+        if "vit" not in args.model:
+            raise ValueError("--use_learnable_post_layernorm_scale currently supports ViT models only.")
+        apply_learnable_post_norm_scale_vit(
+            model,
+            init_value=args.learnable_post_layernorm_scale_init_value,
+        )
     if args.use_residual_branch_scale and args.use_learnable_residual_branch_scale:
         raise ValueError("Choose only one of --use_residual_branch_scale or --use_learnable_residual_branch_scale")
     if args.use_residual_branch_scale:
