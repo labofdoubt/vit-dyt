@@ -164,6 +164,22 @@ def set_vit_block_norm_gamma_init(model: nn.Module, value: float):
                 if isinstance(module, norm_types) and getattr(module, "weight", None) is not None:
                     module.weight.fill_(value)
 
+
+def replace_vit_final_fc_norm_with_derf(model: nn.Module, alpha_init_value: float):
+    """
+    Replace only ViT `fc_norm` with DynamicErf, leaving block-local norms unchanged.
+    """
+    if not hasattr(model, "fc_norm"):
+        raise ValueError("Final fc_norm replacement currently supports ViT models with an `fc_norm` attribute.")
+    if not isinstance(model.fc_norm, nn.LayerNorm):
+        raise ValueError("Expected model.fc_norm to be an nn.LayerNorm before DynamicErf replacement.")
+
+    model.fc_norm = DynamicErf(
+        model.fc_norm.normalized_shape,
+        channels_last=True,
+        alpha_init_value=alpha_init_value,
+    )
+
 def get_args_parser():
     parser = argparse.ArgumentParser('ConvNeXt training and evaluation script for image classification', add_help=False)
     parser.add_argument('--batch_size', default=64, type=int,
@@ -344,6 +360,10 @@ def get_args_parser():
                         help='Initial value for Derf alpha (only used when --dynamic_erf true).')
     parser.add_argument('--derf_freeze_alpha', type=str2bool, default=False,
                         help='If true, keep DynamicErf alpha fixed at its initialization value.')
+    parser.add_argument('--final_fc_norm_dynamic_erf', type=str2bool, default=False,
+                        help='If true, replace only ViT fc_norm with DynamicErf and keep block-local LayerNorms unchanged.')
+    parser.add_argument('--final_fc_norm_derf_alpha_init_value', type=float, default=0.5,
+                        help='Initial value for DynamicErf alpha when --final_fc_norm_dynamic_erf is true.')
     parser.add_argument('--final_ln_not_replaced', type=str2bool, default=False,
                         help='If true, keep the final ViT LayerNorm (`norm` or `fc_norm`) as LayerNorm when using --dynamic_tanh or --dynamic_erf.')
     parser.add_argument('--unbounded_act', type=str2bool, default=False,
@@ -475,10 +495,11 @@ def main(args):
     activation_overrides = [
         args.dynamic_tanh,
         args.dynamic_erf,
+        args.final_fc_norm_dynamic_erf,
         args.unbounded_act,
     ]
     if sum(activation_overrides) > 1:
-        raise ValueError("Choose only one of --dynamic_tanh, --dynamic_erf, or --unbounded_act")
+        raise ValueError("Choose only one of --dynamic_tanh, --dynamic_erf, --final_fc_norm_dynamic_erf, or --unbounded_act")
     if args.dynamic_tanh:
         model = convert_ln_to_dyt(
             model,
@@ -491,6 +512,13 @@ def main(args):
             alpha_init_value=args.derf_alpha_init_value,
             freeze_alpha=args.derf_freeze_alpha,
             final_ln_not_replaced=args.final_ln_not_replaced,
+        )
+    if args.final_fc_norm_dynamic_erf:
+        if "vit" not in args.model:
+            raise ValueError("--final_fc_norm_dynamic_erf currently supports ViT models only.")
+        replace_vit_final_fc_norm_with_derf(
+            model,
+            alpha_init_value=args.final_fc_norm_derf_alpha_init_value,
         )
     if args.unbounded_act:
         model = convert_ln_to_unbounded_act(model, alpha=args.unbounded_act_alpha)
