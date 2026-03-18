@@ -7,6 +7,7 @@ import gc
 import importlib.util
 import math
 import pickle
+import random
 import subprocess
 import sys
 import shutil
@@ -365,6 +366,7 @@ def configure_times_like_tex_fonts():
     })
 
 def seed_all(seed: int = 0):
+    random.seed(seed)
     torch.manual_seed(seed)
     np.random.seed(seed)
     if torch.cuda.is_available():
@@ -662,6 +664,7 @@ class APJNFitConfig:
     preln_scale_num: int = 41
     refine_radius: float = 0.2
     rescale_vit_preln_apjn: bool = False
+    mask_all_p_values: bool = False
 
 @dataclass
 class PanelDConfig:
@@ -778,6 +781,7 @@ def simulate_recursions_full(
     sigma_v: float = 0.64,
     sigma_a: float = 0.64 * 0.64,
     q0: float = 1.0,
+    mask_all_p_values: bool = False,
 ):
     L = int(num_layers)
     n = float(n_tokens)
@@ -788,7 +792,7 @@ def simulate_recursions_full(
     chi_att = np.zeros(L, dtype=float)
     chi_mlp = np.zeros(L, dtype=float)
 
-    q[0], p[0] = float(q0), float(p0)
+    q[0], p[0] = float(q0), float(0.0 if mask_all_p_values else p0)
 
     att_scale = (sigma_o ** 2) * (sigma_v ** 2)
     mlp_scale = (sigma_w1 ** 2) * (sigma_w2 ** 2)
@@ -802,13 +806,16 @@ def simulate_recursions_full(
 
             chi_att[l] = 1.0
 
-            beta = np.exp((sigma_a ** 2) * uq * (up - uq))
-            gamma = np.exp((sigma_a ** 2) * up * (up - uq))
-            q_mix = (uq + (n - 1.0) * up * beta) / (1.0 + (n - 1.0) * beta)
-            p_mix = (uq + (n - 1.0) * up * gamma) / (1.0 + (n - 1.0) * gamma)
-
-            qh = ql + att_scale * q_mix
-            ph = pl + att_scale * p_mix
+            # beta = np.exp((sigma_a ** 2) * uq * (up - uq))
+            # gamma = np.exp((sigma_a ** 2) * up * (up - uq))
+            if mask_all_p_values:
+                qh = ql + att_scale * up
+                ph = 0.0
+            else:
+                # q_mix = (uq + (n - 1.0) * up * beta) / (1.0 + (n - 1.0) * beta)
+                # p_mix = (uq + (n - 1.0) * up * gamma) / (1.0 + (n - 1.0) * gamma)
+                qh = ql + att_scale * up
+                ph = pl + att_scale * up
 
             chi_mlp[l] = 1.0 + mlp_scale * (2.0 * alpha**2 / np.pi) * (1.0 / np.sqrt(1.0 + 4.0 * alpha**2 * qh))
 
@@ -817,33 +824,36 @@ def simulate_recursions_full(
             rho_half = np.clip(v_half / (u_half + eps), -1.0, 1.0)
 
             dq_mlp = 0.5 * mlp_scale * u_half
-            dp_mlp = mlp_scale * u_half * kappa_relu_np(rho_half)
+            dp_mlp = 0.0 if mask_all_p_values else mlp_scale * u_half * kappa_relu_np(rho_half)
 
             q[l + 1] = qh + dq_mlp
-            p[l + 1] = ph + dp_mlp
+            p[l + 1] = 0.0 if mask_all_p_values else ph + dp_mlp
 
         elif mode.lower() == "layernorm":
             rho = np.clip(pl / (ql + eps), -1.0, 1.0)
-            beta = np.exp((sigma_a ** 2) * (rho - 1.0))
-            gamma = np.exp((sigma_a ** 2) * rho * (rho - 1.0))
+            # beta = np.exp((sigma_a ** 2) * (rho - 1.0))
+            # gamma = np.exp((sigma_a ** 2) * rho * (rho - 1.0))
 
             qprime = 1.0 / (ql + eps)
             chi_att[l] = 1.0
 
-            q_mix = (1.0 + (n - 1.0) * rho * beta) / (1.0 + (n - 1.0) * beta)
-            p_mix = (1.0 + (n - 1.0) * rho * gamma) / (1.0 + (n - 1.0) * gamma)
-
-            qh = ql + att_scale * q_mix
-            ph = pl + att_scale * p_mix
+            if mask_all_p_values:
+                qh = ql + att_scale * rho
+                ph = 0.0
+            else:
+                # q_mix = (1.0 + (n - 1.0) * rho * beta) / (1.0 + (n - 1.0) * beta)
+                # p_mix = (1.0 + (n - 1.0) * rho * gamma) / (1.0 + (n - 1.0) * gamma)
+                qh = ql + att_scale * rho
+                ph = pl + att_scale * rho
 
             chi_mlp[l] = 1.0 + mlp_scale / (2.0 * (qh + eps))
 
             rho_half = np.clip(ph / (qh + eps), -1.0, 1.0)
             dq_mlp = 0.5 * mlp_scale
-            dp_mlp = mlp_scale * kappa_relu_np(rho_half)
+            dp_mlp = 0.0 if mask_all_p_values else mlp_scale * kappa_relu_np(rho_half)
 
             q[l + 1] = qh + dq_mlp
-            p[l + 1] = ph + dp_mlp
+            p[l + 1] = 0.0 if mask_all_p_values else ph + dp_mlp
         else:
             raise ValueError("mode must be 'erf' or 'layernorm'")
 
@@ -875,6 +885,7 @@ def compute_theory_qp_bundle(
     q0: float,
     p0: float,
     mean_field_cfg: MeanFieldConfig,
+    mask_all_p_values: bool = False,
 ):
     alphas = np.asarray(alphas, dtype=float)
     preln = simulate_recursions_full(
@@ -883,6 +894,7 @@ def compute_theory_qp_bundle(
         p0=p0,
         n_tokens=n_tokens,
         mode="layernorm",
+        mask_all_p_values=mask_all_p_values,
         sigma_w1=mean_field_cfg.sigma_w1,
         sigma_w2=mean_field_cfg.sigma_w2,
         sigma_o=mean_field_cfg.sigma_o,
@@ -898,6 +910,7 @@ def compute_theory_qp_bundle(
             n_tokens=n_tokens,
             mode="erf",
             alpha=float(a),
+            mask_all_p_values=mask_all_p_values,
             sigma_w1=mean_field_cfg.sigma_w1,
             sigma_w2=mean_field_cfg.sigma_w2,
             sigma_o=mean_field_cfg.sigma_o,
@@ -908,6 +921,110 @@ def compute_theory_qp_bundle(
         "l": np.arange(num_layers + 1, dtype=int),
         "preln": preln,
         "derf": derf,
+    }
+
+
+def simulate_recursions_full_grid(
+    num_layers: int,
+    q0_grid,
+    p0_grid,
+    n_tokens: int,
+    mode: str,
+    alpha: float = 1.0,
+    sigma_w1: float = 0.64,
+    sigma_w2: float = 1.28,
+    sigma_o: float = 0.64,
+    sigma_v: float = 0.64,
+    sigma_a: float = 0.64 * 0.64,
+    mask_all_p_values: bool = False,
+):
+    q0_grid = np.asarray(q0_grid, dtype=float).reshape(-1)
+    p0_grid = np.asarray(p0_grid, dtype=float).reshape(-1)
+    if q0_grid.shape != p0_grid.shape:
+        raise ValueError("q0_grid and p0_grid must have the same shape.")
+
+    G = q0_grid.size
+    L = int(num_layers)
+    eps = 1e-12
+
+    q = np.zeros((G, L + 1), dtype=float)
+    p = np.zeros((G, L + 1), dtype=float)
+    chi_att = np.zeros((G, L), dtype=float)
+    chi_mlp = np.zeros((G, L), dtype=float)
+
+    q[:, 0] = q0_grid
+    p[:, 0] = 0.0 if mask_all_p_values else p0_grid
+
+    att_scale = (sigma_o ** 2) * (sigma_v ** 2)
+    mlp_scale = (sigma_w1 ** 2) * (sigma_w2 ** 2)
+
+    for l in range(L):
+        ql = q[:, l]
+        pl = p[:, l]
+
+        if mode.lower() == "erf":
+            uq = tilde_q_erf_np(ql, alpha)
+            up = tilde_p_erf_np(ql, pl, alpha)
+            chi_att[:, l] = 1.0
+
+            if mask_all_p_values:
+                qh = ql + att_scale * up
+                ph = np.zeros_like(qh)
+            else:
+                qh = ql + att_scale * up
+                ph = pl + att_scale * up
+
+            chi_mlp[:, l] = 1.0 + mlp_scale * (2.0 * alpha**2 / np.pi) * (
+                1.0 / np.sqrt(1.0 + 4.0 * alpha**2 * qh)
+            )
+
+            u_half = tilde_q_erf_np(qh, alpha)
+            v_half = tilde_p_erf_np(qh, ph, alpha)
+            rho_half = np.clip(v_half / (u_half + eps), -1.0, 1.0)
+
+            dq_mlp = 0.5 * mlp_scale * u_half
+            dp_mlp = np.zeros_like(dq_mlp) if mask_all_p_values else mlp_scale * u_half * kappa_relu_np(rho_half)
+
+            q[:, l + 1] = qh + dq_mlp
+            p[:, l + 1] = 0.0 if mask_all_p_values else ph + dp_mlp
+
+        elif mode.lower() == "layernorm":
+            rho = np.clip(pl / (ql + eps), -1.0, 1.0)
+            chi_att[:, l] = 1.0
+
+            if mask_all_p_values:
+                qh = ql + att_scale * rho
+                ph = np.zeros_like(qh)
+            else:
+                qh = ql + att_scale * rho
+                ph = pl + att_scale * rho
+
+            chi_mlp[:, l] = 1.0 + mlp_scale / (2.0 * (qh + eps))
+            rho_half = np.clip(ph / (qh + eps), -1.0, 1.0)
+            dq_mlp = np.full_like(qh, 0.5 * mlp_scale)
+            dp_mlp = np.zeros_like(qh) if mask_all_p_values else mlp_scale * kappa_relu_np(rho_half)
+
+            q[:, l + 1] = qh + dq_mlp
+            p[:, l + 1] = 0.0 if mask_all_p_values else ph + dp_mlp
+        else:
+            raise ValueError("mode must be 'erf' or 'layernorm'")
+
+    chi = chi_att * chi_mlp
+    J_direct = np.ones((G, L + 1), dtype=float)
+    for l in range(L):
+        J_direct[:, l + 1] = J_direct[:, l] * chi[:, l]
+
+    J = np.ones((G, L + 1), dtype=float)
+    J[:, L] = 1.0
+    for l in range(L - 1, -1, -1):
+        J[:, l] = J[:, l + 1] * chi[:, l]
+
+    return {
+        "q": q,
+        "p": p,
+        "chi": chi,
+        "J": J,
+        "J_direct": J_direct,
     }
 
 # -------------------- panel (d) asymptotics --------------------
@@ -1073,10 +1190,13 @@ def build_panel_d_curves(panel_d_cfg: PanelDConfig, alphas, cifar_panel_bundle=N
     theory_q0 = float(panel_d_cfg.q0)
     theory_p0 = float(panel_d_cfg.p0)
     preln_scale_C = 1.0
+    mask_all_p_values = False
     if panel_d_fit_bundle:
         theory_q0 = float(panel_d_fit_bundle.get("q0", theory_q0))
         theory_p0 = float(panel_d_fit_bundle.get("p0", theory_p0))
-        preln_scale_C = float(panel_d_fit_bundle.get("preln_scale_C", 1.0))
+        preln_scale_C_raw = panel_d_fit_bundle.get("preln_scale_C", 1.0)
+        preln_scale_C = 1.0 if preln_scale_C_raw is None else float(preln_scale_C_raw)
+        mask_all_p_values = bool(panel_d_fit_bundle.get("mask_all_p_values", False))
 
     L = int(panel_d_cfg.num_layers)
     sigma_OV = mf.sigma_o * mf.sigma_v
@@ -1090,6 +1210,7 @@ def build_panel_d_curves(panel_d_cfg: PanelDConfig, alphas, cifar_panel_bundle=N
         p0=theory_p0,
         n_tokens=panel_d_cfg.n_tokens,
         mode="layernorm",
+        mask_all_p_values=mask_all_p_values,
         sigma_w1=mf.sigma_w1,
         sigma_w2=mf.sigma_w2,
         sigma_o=mf.sigma_o,
@@ -1118,6 +1239,7 @@ def build_panel_d_curves(panel_d_cfg: PanelDConfig, alphas, cifar_panel_bundle=N
             n_tokens=panel_d_cfg.n_tokens,
             mode="erf",
             alpha=float(a),
+            mask_all_p_values=mask_all_p_values,
             sigma_w1=mf.sigma_w1,
             sigma_w2=mf.sigma_w2,
             sigma_o=mf.sigma_o,
@@ -1155,6 +1277,7 @@ def build_panel_d_curves(panel_d_cfg: PanelDConfig, alphas, cifar_panel_bundle=N
             "q0": theory_q0,
             "p0": theory_p0,
             "preln_scale_C": preln_scale_C,
+            "mask_all_p_values": mask_all_p_values,
         },
         "preln": {
             "logJ": logJ_ln,
@@ -2042,6 +2165,7 @@ def run_cifar_apjn_experiment(
     batch_meta = None
     block0_input_override = None
     if input_source == "cifar":
+        seed_all(int(apjn_cfg.cifar_batch_seed) + int(apjn_cfg.cifar_batch_draw_index))
         samples, targets, batch_meta = get_cifar_batch(
             batch_size=batch_size,
             img_size=model_cfg.img_size,
@@ -2303,6 +2427,7 @@ def fit_panel_d_direct_initial_conditions(
     c_values = _resolve_grid_values(getattr(fit_cfg, "preln_scale_values", None), getattr(fit_cfg, "preln_scale_num", 41))
     refine_radius = float(getattr(fit_cfg, "refine_radius", 0.2))
     rescale_vit_preln_apjn = bool(getattr(fit_cfg, "rescale_vit_preln_apjn", False))
+    mask_all_p_values = bool(getattr(fit_cfg, "mask_all_p_values", False))
 
     max_layer = max(int(l) for l in direct_data["layers"])
     fit_layers = max(1, max_layer)
@@ -2335,57 +2460,102 @@ def fit_panel_d_direct_initial_conditions(
     def _fit_qp_for_subset(*, preln_subset, derf_subset, c_scale=1.0, q_grid=None, p_grid=None):
         q_grid = q0_values if q_grid is None else np.asarray(q_grid, dtype=float)
         p_grid = p0_values if p_grid is None else np.asarray(p_grid, dtype=float)
-        best = None
-        for q0 in q_grid:
-            for p0 in p_grid:
-                if p0 > q0 + 1e-12:
-                    continue
-
-                theory_bundle = compute_theory_qp_bundle(
-                    num_layers=fit_layers,
-                    alphas=alpha_arr,
-                    n_tokens=n_tokens,
-                    q0=float(q0),
-                    p0=float(p0),
-                    mean_field_cfg=mean_field_cfg,
-                )
-
-                metrics = []
-
-                if preln_subset:
-                    layer_ids = sorted(int(l) for l in preln_subset.keys())
-                    vit_vals = [preln_subset[l] for l in layer_ids]
-                    th_vals = _scaled_preln_curve(theory_bundle["preln"]["J_direct"], c_scale, layer_ids)
-                    val = _metric_ignore_nan(vit_vals, th_vals)
-                    if val is not None:
-                        metrics.append(val)
-
-                for a in alpha_arr:
-                    a_float = float(a)
-                    if a_float not in derf_subset:
-                        continue
-                    layer_ids = sorted(int(l) for l in derf_subset[a_float].keys())
-                    vit_vals = [derf_subset[a_float][l] for l in layer_ids]
-                    th_vals = [theory_bundle["derf"][a_float]["J_direct"][l] for l in layer_ids]
-                    val = _metric_ignore_nan(vit_vals, th_vals)
-                    if val is not None:
-                        metrics.append(val)
-
-                if not metrics:
-                    continue
-
-                value = float(np.mean(metrics))
-                if best is None or value < best["value"]:
-                    best = {
-                        "q0": float(q0),
-                        "p0": float(p0),
-                        "value": value,
-                        "metric": metric,
-                    }
-
-        if best is None:
+        q_mesh, p_mesh = np.meshgrid(q_grid, p_grid, indexing="xy")
+        valid_mask = p_mesh <= q_mesh + 1e-12
+        if not np.any(valid_mask):
             raise RuntimeError("Unable to fit panel (d) direct measurements; check the grid or data availability.")
-        return best
+        q_valid = q_mesh[valid_mask]
+        p_valid = p_mesh[valid_mask]
+        metric_sum = np.zeros(q_valid.shape[0], dtype=float)
+        metric_count = np.zeros(q_valid.shape[0], dtype=float)
+
+        if preln_subset:
+            layer_ids = sorted(int(l) for l in preln_subset.keys())
+            vit_vals = np.asarray([preln_subset[l] for l in layer_ids], dtype=float)
+            preln_grid = simulate_recursions_full_grid(
+                num_layers=fit_layers,
+                q0_grid=q_valid,
+                p0_grid=p_valid,
+                n_tokens=n_tokens,
+                mode="layernorm",
+                sigma_w1=mean_field_cfg.sigma_w1,
+                sigma_w2=mean_field_cfg.sigma_w2,
+                sigma_o=mean_field_cfg.sigma_o,
+                sigma_v=mean_field_cfg.sigma_v,
+                sigma_a=mean_field_cfg.sigma_a,
+                mask_all_p_values=mask_all_p_values,
+            )
+            th_vals = preln_grid["J_direct"][:, layer_ids]
+            if c_scale != 1.0:
+                scale_mask = np.asarray([int(l) >= 1 for l in layer_ids], dtype=float)
+                th_vals = th_vals * (1.0 + (float(c_scale) - 1.0) * scale_mask[None, :])
+            val = np.mean(np.abs(th_vals - vit_vals[None, :]) / np.maximum(np.abs(vit_vals[None, :]), 1e-12), axis=1) if metric == "mape" else np.mean((th_vals - vit_vals[None, :]) ** 2, axis=1)
+            metric_sum += val
+            metric_count += 1.0
+
+        for a in alpha_arr:
+            a_float = float(a)
+            if a_float not in derf_subset:
+                continue
+            layer_ids = sorted(int(l) for l in derf_subset[a_float].keys())
+            vit_vals = np.asarray([derf_subset[a_float][l] for l in layer_ids], dtype=float)
+            derf_grid = simulate_recursions_full_grid(
+                num_layers=fit_layers,
+                q0_grid=q_valid,
+                p0_grid=p_valid,
+                n_tokens=n_tokens,
+                mode="erf",
+                alpha=a_float,
+                sigma_w1=mean_field_cfg.sigma_w1,
+                sigma_w2=mean_field_cfg.sigma_w2,
+                sigma_o=mean_field_cfg.sigma_o,
+                sigma_v=mean_field_cfg.sigma_v,
+                sigma_a=mean_field_cfg.sigma_a,
+                mask_all_p_values=mask_all_p_values,
+            )
+            th_vals = derf_grid["J_direct"][:, layer_ids]
+            val = np.mean(np.abs(th_vals - vit_vals[None, :]) / np.maximum(np.abs(vit_vals[None, :]), 1e-12), axis=1) if metric == "mape" else np.mean((th_vals - vit_vals[None, :]) ** 2, axis=1)
+            metric_sum += val
+            metric_count += 1.0
+
+        valid_eval = metric_count > 0
+        if not np.any(valid_eval):
+            raise RuntimeError("Unable to fit panel (d) direct measurements; check the grid or data availability.")
+        values = np.full(q_valid.shape[0], np.nan, dtype=float)
+        values[valid_eval] = metric_sum[valid_eval] / metric_count[valid_eval]
+        best_valid_idx = int(np.nanargmin(values))
+        return {
+            "q0": float(q_valid[best_valid_idx]),
+            "p0": float(p_valid[best_valid_idx]),
+            "value": float(values[best_valid_idx]),
+            "metric": metric,
+        }
+
+    def _per_curve_direct_metric(theory_bundle, *, preln_subset, derf_subset, c_scale=1.0):
+        out = {"preln": None, "derf": {}}
+        if preln_subset:
+            layer_ids = sorted(int(l) for l in preln_subset.keys())
+            vit_vals = [preln_subset[l] for l in layer_ids]
+            th_vals = _scaled_preln_curve(theory_bundle["preln"]["J_direct"], c_scale, layer_ids)
+            out["preln"] = _metric_ignore_nan(vit_vals, th_vals)
+        for a in alpha_arr:
+            a_float = float(a)
+            if a_float not in derf_subset:
+                continue
+            layer_ids = sorted(int(l) for l in derf_subset[a_float].keys())
+            vit_vals = [derf_subset[a_float][l] for l in layer_ids]
+            th_vals = [theory_bundle["derf"][a_float]["J_direct"][l] for l in layer_ids]
+            out["derf"][a_float] = _metric_ignore_nan(vit_vals, th_vals)
+        return out
+
+    def _direct_vit_points(preln_subset, derf_subset):
+        return {
+            "preln": {int(l): float(v) for l, v in preln_subset.items()},
+            "derf": {
+                float(a): {int(l): float(v) for l, v in derf_subset[float(a)].items()}
+                for a in derf_subset.keys()
+            },
+        }
 
     derf_fit = _fit_qp_for_subset(preln_subset={}, derf_subset=direct_data["derf"], c_scale=1.0)
 
@@ -2396,6 +2566,7 @@ def fit_panel_d_direct_initial_conditions(
         q0=float(derf_fit["q0"]),
         p0=float(derf_fit["p0"]),
         mean_field_cfg=mean_field_cfg,
+        mask_all_p_values=mask_all_p_values,
     )
 
     if rescale_vit_preln_apjn:
@@ -2434,6 +2605,21 @@ def fit_panel_d_direct_initial_conditions(
             q_grid=q_local,
             p_grid=p_local,
         )
+        final_theory_bundle = compute_theory_qp_bundle(
+            num_layers=fit_layers,
+            alphas=alpha_arr,
+            n_tokens=n_tokens,
+            q0=float(final_fit["q0"]),
+            p0=float(final_fit["p0"]),
+            mean_field_cfg=mean_field_cfg,
+            mask_all_p_values=mask_all_p_values,
+        )
+        per_curve_metric = _per_curve_direct_metric(
+            final_theory_bundle,
+            preln_subset=preln_rescaled_for_fit,
+            derf_subset=direct_data["derf"],
+            c_scale=1.0,
+        )
 
         return {
             "q0": final_fit["q0"],
@@ -2441,48 +2627,127 @@ def fit_panel_d_direct_initial_conditions(
             "value": final_fit["value"],
             "metric": metric,
             "rescale_vit_preln_apjn": True,
+            "mask_all_p_values": mask_all_p_values,
             "preln_scale_C": None,
             "preln_layer1_vit": vit_anchor,
             "preln_layer1_theory": theory_anchor,
             "derf_only_fit": derf_fit,
+            "vit_points": _direct_vit_points(preln_rescaled_for_fit, direct_data["derf"]),
+            "per_curve_metric": per_curve_metric,
             "preln_rescaled_data": preln_rescaled,
             "preln_rescaled_fit_data": preln_rescaled_for_fit,
+            "theory_bundle": final_theory_bundle,
             "final_fit": final_fit,
         }
 
-    best_c = None
+    q_mesh, p_mesh = np.meshgrid(q0_values, p0_values, indexing="xy")
+    valid_mask = p_mesh <= q_mesh + 1e-12
+    if not np.any(valid_mask):
+        raise RuntimeError("Unable to fit panel (d) direct measurements; check the q0/p0 grid.")
+    q_valid = q_mesh[valid_mask]
+    p_valid = p_mesh[valid_mask]
+
+    derf_metric_sum = np.zeros(q_valid.shape[0], dtype=float)
+    derf_metric_count = 0.0
+    for a in alpha_arr:
+        a_float = float(a)
+        if a_float not in direct_data["derf"]:
+            continue
+        layer_ids = sorted(int(l) for l in direct_data["derf"][a_float].keys())
+        vit_vals = np.asarray([direct_data["derf"][a_float][l] for l in layer_ids], dtype=float)
+        derf_grid = simulate_recursions_full_grid(
+            num_layers=fit_layers,
+            q0_grid=q_valid,
+            p0_grid=p_valid,
+            n_tokens=n_tokens,
+            mode="erf",
+            alpha=a_float,
+            sigma_w1=mean_field_cfg.sigma_w1,
+            sigma_w2=mean_field_cfg.sigma_w2,
+            sigma_o=mean_field_cfg.sigma_o,
+            sigma_v=mean_field_cfg.sigma_v,
+            sigma_a=mean_field_cfg.sigma_a,
+            mask_all_p_values=mask_all_p_values,
+        )
+        th_vals = derf_grid["J_direct"][:, layer_ids]
+        derf_metric = np.mean(
+            np.abs(th_vals - vit_vals[None, :]) / np.maximum(np.abs(vit_vals[None, :]), 1e-12),
+            axis=1,
+        ) if metric == "mape" else np.mean((th_vals - vit_vals[None, :]) ** 2, axis=1)
+        derf_metric_sum += derf_metric
+        derf_metric_count += 1.0
+
     if direct_data["preln"]:
         layer_ids = sorted(int(l) for l in direct_data["preln"].keys())
-        vit_vals = [direct_data["preln"][l] for l in layer_ids]
-        for c_scale in c_values:
-            th_vals = _scaled_preln_curve(derf_theory_bundle["preln"]["J_direct"], c_scale, layer_ids)
-            val = _metric_ignore_nan(vit_vals, th_vals)
-            if val is None:
-                continue
-            if best_c is None or val < best_c["value"]:
-                best_c = {
-                    "C": float(c_scale),
-                    "value": float(val),
-                    "metric": metric,
-                }
-    if best_c is None:
-        raise RuntimeError("Unable to fit the pre-LN multiplicative factor C; check the C-grid or data availability.")
-
-    q_ref = float(derf_fit["q0"])
-    p_ref = float(derf_fit["p0"])
-    q_local = q0_values[(q0_values >= q_ref - refine_radius - 1e-12) & (q0_values <= q_ref + refine_radius + 1e-12)]
-    p_local = p0_values[(p0_values >= p_ref - refine_radius - 1e-12) & (p0_values <= p_ref + refine_radius + 1e-12)]
-    if q_local.size == 0:
-        q_local = np.asarray([q_ref], dtype=float)
-    if p_local.size == 0:
-        p_local = np.asarray([p_ref], dtype=float)
-
-    final_fit = _fit_qp_for_subset(
+        vit_vals = np.asarray([direct_data["preln"][l] for l in layer_ids], dtype=float)
+        preln_grid = simulate_recursions_full_grid(
+            num_layers=fit_layers,
+            q0_grid=q_valid,
+            p0_grid=p_valid,
+            n_tokens=n_tokens,
+            mode="layernorm",
+            sigma_w1=mean_field_cfg.sigma_w1,
+            sigma_w2=mean_field_cfg.sigma_w2,
+            sigma_o=mean_field_cfg.sigma_o,
+            sigma_v=mean_field_cfg.sigma_v,
+            sigma_a=mean_field_cfg.sigma_a,
+            mask_all_p_values=mask_all_p_values,
+        )
+        base_th = preln_grid["J_direct"][:, layer_ids]
+        scale_mask = np.asarray([int(l) >= 1 for l in layer_ids], dtype=float)
+        scales = 1.0 + (np.asarray(c_values, dtype=float)[:, None] - 1.0) * scale_mask[None, :]
+        th_grid = base_th[:, None, :] * scales[None, :, :]
+        if metric == "mape":
+            preln_metric = np.mean(
+                np.abs(th_grid - vit_vals[None, None, :]) / np.maximum(np.abs(vit_vals[None, None, :]), 1e-12),
+                axis=2,
+            )
+        else:
+            preln_metric = np.mean((th_grid - vit_vals[None, None, :]) ** 2, axis=2)
+        overall_metric = (derf_metric_sum[:, None] + preln_metric) / max(derf_metric_count + 1.0, 1.0)
+        best_flat = int(np.nanargmin(overall_metric))
+        best_qp_idx, best_c_idx = np.unravel_index(best_flat, overall_metric.shape)
+        best_c = {
+            "C": float(c_values[best_c_idx]),
+            "value": float(preln_metric[best_qp_idx, best_c_idx]),
+            "metric": metric,
+        }
+        final_fit = {
+            "q0": float(q_valid[best_qp_idx]),
+            "p0": float(p_valid[best_qp_idx]),
+            "value": float(overall_metric[best_qp_idx, best_c_idx]),
+            "metric": metric,
+        }
+    else:
+        if derf_metric_count <= 0:
+            raise RuntimeError("Unable to fit panel (d): no direct APJN measurements found.")
+        overall_metric = derf_metric_sum / derf_metric_count
+        best_qp_idx = int(np.nanargmin(overall_metric))
+        best_c = {
+            "C": 1.0,
+            "value": float("nan"),
+            "metric": metric,
+        }
+        final_fit = {
+            "q0": float(q_valid[best_qp_idx]),
+            "p0": float(p_valid[best_qp_idx]),
+            "value": float(overall_metric[best_qp_idx]),
+            "metric": metric,
+        }
+    final_theory_bundle = compute_theory_qp_bundle(
+        num_layers=fit_layers,
+        alphas=alpha_arr,
+        n_tokens=n_tokens,
+        q0=float(final_fit["q0"]),
+        p0=float(final_fit["p0"]),
+        mean_field_cfg=mean_field_cfg,
+        mask_all_p_values=mask_all_p_values,
+    )
+    per_curve_metric = _per_curve_direct_metric(
+        final_theory_bundle,
         preln_subset=direct_data["preln"],
         derf_subset=direct_data["derf"],
         c_scale=best_c["C"],
-        q_grid=q_local,
-        p_grid=p_local,
     )
 
     return {
@@ -2491,9 +2756,13 @@ def fit_panel_d_direct_initial_conditions(
         "value": final_fit["value"],
         "metric": metric,
         "rescale_vit_preln_apjn": False,
+        "mask_all_p_values": mask_all_p_values,
         "preln_scale_C": float(best_c["C"]),
         "derf_only_fit": derf_fit,
+        "vit_points": _direct_vit_points(direct_data["preln"], direct_data["derf"]),
+        "per_curve_metric": per_curve_metric,
         "preln_scale_fit": best_c,
+        "theory_bundle": final_theory_bundle,
         "final_fit": final_fit,
     }
 
@@ -2568,42 +2837,99 @@ def fit_theory_for_apjn(
     alphas = np.asarray(cifar_apjn_bundle["derf_pack_with_J"]["alphas"], dtype=float)
     depth = int(cifar_apjn_bundle["depth"])
     n_tokens = int(cifar_apjn_bundle["seq_len"] - 1)
+    mask_all_p_values = bool(getattr(fit_cfg, "mask_all_p_values", False))
 
-    best = None
-    metric_matrix = np.full((len(p0_values), len(q0_values)), np.nan, dtype=float)
+    preln_j_raw = cifar_apjn_bundle["preln_with_J"]["J_raw"]
+    apjn_layers = sorted(int(l) for l in preln_j_raw.keys())
+    keep_layers = [l for l in apjn_layers if l > 0]
+    x_shift = np.asarray([l - 1 for l in keep_layers], dtype=int)
+    preln_vit = np.asarray([preln_j_raw[l] for l in keep_layers], dtype=float)
+    derf_vit = {}
+    for r in cifar_apjn_bundle["derf_pack_with_J"]["results"]:
+        a = float(r["alpha"])
+        derf_vit[a] = np.asarray([r["J_raw"][l] for l in keep_layers], dtype=float)
 
-    for iq, q0 in enumerate(q0_values):
-        for ip, p0 in enumerate(p0_values):
-            if p0 > q0 + 1e-12:
-                continue
+    q_mesh, p_mesh = np.meshgrid(q0_values, p0_values, indexing="xy")
+    valid_mask = p_mesh <= q_mesh + 1e-12
+    q_valid = q_mesh[valid_mask]
+    p_valid = p_mesh[valid_mask]
+    metric_matrix = np.full(q_mesh.shape, np.nan, dtype=float)
 
-            theory_bundle = compute_theory_qp_bundle(
-                num_layers=depth,
-                alphas=alphas,
-                n_tokens=n_tokens,
-                q0=float(q0),
-                p0=float(p0),
-                mean_field_cfg=mean_field_cfg,
-            )
-            arrs = _panel_c_apjn_arrays(cifar_apjn_bundle, theory_bundle)
+    preln_grid = simulate_recursions_full_grid(
+        num_layers=depth,
+        q0_grid=q_valid,
+        p0_grid=p_valid,
+        n_tokens=n_tokens,
+        mode="layernorm",
+        sigma_w1=mean_field_cfg.sigma_w1,
+        sigma_w2=mean_field_cfg.sigma_w2,
+        sigma_o=mean_field_cfg.sigma_o,
+        sigma_v=mean_field_cfg.sigma_v,
+        sigma_a=mean_field_cfg.sigma_a,
+        mask_all_p_values=mask_all_p_values,
+    )
+    preln_th = preln_grid["J"][:, keep_layers]
+    preln_metric = np.mean(np.abs(preln_th - preln_vit[None, :]) / np.maximum(np.abs(preln_vit[None, :]), 1e-12), axis=1) if metric == "mape" else np.mean((preln_th - preln_vit[None, :]) ** 2, axis=1)
+    metric_sum = preln_metric.copy()
+    metric_count = np.ones_like(metric_sum, dtype=float)
 
-            vals = [_fit_metric_value(arrs["preln_vit"], arrs["preln_th"], metric)]
-            for a in alphas:
-                vals.append(_fit_metric_value(arrs["derf_vit"][float(a)], arrs["derf_th"][float(a)], metric))
-            value = float(np.mean(vals))
-            metric_matrix[ip, iq] = value
+    for a in alphas:
+        a_float = float(a)
+        derf_grid = simulate_recursions_full_grid(
+            num_layers=depth,
+            q0_grid=q_valid,
+            p0_grid=p_valid,
+            n_tokens=n_tokens,
+            mode="erf",
+            alpha=a_float,
+            sigma_w1=mean_field_cfg.sigma_w1,
+            sigma_w2=mean_field_cfg.sigma_w2,
+            sigma_o=mean_field_cfg.sigma_o,
+            sigma_v=mean_field_cfg.sigma_v,
+            sigma_a=mean_field_cfg.sigma_a,
+            mask_all_p_values=mask_all_p_values,
+        )
+        derf_th = derf_grid["J"][:, keep_layers]
+        derf_metric = np.mean(np.abs(derf_th - derf_vit[a_float][None, :]) / np.maximum(np.abs(derf_vit[a_float][None, :]), 1e-12), axis=1) if metric == "mape" else np.mean((derf_th - derf_vit[a_float][None, :]) ** 2, axis=1)
+        metric_sum += derf_metric
+        metric_count += 1.0
 
-            if best is None or value < best["value"]:
-                best = {
-                    "value": value,
-                    "q0": float(q0),
-                    "p0": float(p0),
-                    "theory_bundle": theory_bundle,
-                    "panel_c_arrays": arrs,
-                }
+    valid_values = metric_sum / np.maximum(metric_count, 1.0)
+    metric_matrix[valid_mask] = valid_values
+    best_flat = int(np.nanargmin(metric_matrix))
+    ip_best, iq_best = np.unravel_index(best_flat, metric_matrix.shape)
+    best = {
+        "value": float(metric_matrix[ip_best, iq_best]),
+        "q0": float(q0_values[iq_best]),
+        "p0": float(p0_values[ip_best]),
+    }
+    best["theory_bundle"] = compute_theory_qp_bundle(
+        num_layers=depth,
+        alphas=alphas,
+        n_tokens=n_tokens,
+        q0=best["q0"],
+        p0=best["p0"],
+        mean_field_cfg=mean_field_cfg,
+        mask_all_p_values=mask_all_p_values,
+    )
+    best["panel_c_arrays"] = _panel_c_apjn_arrays(cifar_apjn_bundle, best["theory_bundle"])
 
     if best is None:
         raise RuntimeError("No valid (q0, p0) points in fit grid.")
+
+    best_arrs = best["panel_c_arrays"]
+    per_curve_metric = {
+        "preln": _fit_metric_value(best_arrs["preln_vit"], best_arrs["preln_th"], metric),
+        "derf": {
+            float(a): _fit_metric_value(best_arrs["derf_vit"][float(a)], best_arrs["derf_th"][float(a)], metric)
+            for a in alphas
+        },
+    }
+    vit_points = {
+        "x_shift": np.asarray(best_arrs["x_shift"], dtype=int),
+        "preln": np.asarray(best_arrs["preln_vit"], dtype=float),
+        "derf": {float(a): np.asarray(best_arrs["derf_vit"][float(a)], dtype=float) for a in alphas},
+    }
 
     return {
         "metric": metric,
@@ -2613,6 +2939,9 @@ def fit_theory_for_apjn(
         "q0": best["q0"],
         "p0": best["p0"],
         "value": best["value"],
+        "mask_all_p_values": mask_all_p_values,
+        "per_curve_metric": per_curve_metric,
+        "vit_points": vit_points,
         "theory_bundle": best["theory_bundle"],
         "panel_c_arrays": best["panel_c_arrays"],
     }
@@ -3463,6 +3792,16 @@ def _maybe_load_bundle(bundle_or_path):
     return bundle_or_path
 
 
+def _count_bundle_samples(bundle):
+    if not isinstance(bundle, dict):
+        return None
+    if "samples" in bundle:
+        return len(bundle.get("samples", []))
+    if "points" in bundle:
+        return len({int(p.get("sample", -1)) for p in bundle.get("points", []) if "sample" in p})
+    return None
+
+
 def _resolve_plot_text_sizes(
     style_cfg: FinalThreePanelStyleConfig,
     *,
@@ -3574,7 +3913,7 @@ def plot_equangular_p_inverse_direct_figure(
         title_fs=title_fs,
         annotation_fs=annotation_fs,
     )
-    fig = plt.figure(figsize=(14.8, 5.8))
+    fig = plt.figure(figsize=(14.8, 4.8))
     gs = fig.add_gridspec(
         3,
         5,
@@ -3653,6 +3992,15 @@ def plot_equangular_p_inverse_direct_figure(
     prettify_log_axis(ax_inv, "y")
     prettify_axes(ax_inv)
     ax_inv.tick_params(labelsize=sizes["tick_fs"])
+    ax_inv.legend(
+        handles=[
+            Line2D([0], [0], color="black", lw=style_cfg.line_width, label="theory"),
+            Line2D([0], [0], color="black", marker="o", ls="none", markersize=4.5, label="ViT (synth. data)"),
+        ],
+        frameon=False,
+        loc="upper right",
+        fontsize=sizes["annotation_fs"],
+    )
 
     direct_source, direct_layers, dir_preln, dir_derf = _extract_direct_points(apjn_bundle)
     pre_curve = direct_curve_from_source(perm_theory_bundle["preln"]["J_direct"], direct_source)
@@ -3672,6 +4020,15 @@ def plot_equangular_p_inverse_direct_figure(
     prettify_log_axis(ax_dir, "y")
     prettify_axes(ax_dir)
     ax_dir.tick_params(labelsize=sizes["tick_fs"])
+    ax_dir.legend(
+        handles=[
+            Line2D([0], [0], color="black", lw=style_cfg.line_width, label="theory"),
+            Line2D([0], [0], color="black", marker="o", ls="none", markersize=4.5, label="ViT (synth. data)"),
+        ],
+        frameon=False,
+        loc="upper left",
+        fontsize=sizes["annotation_fs"],
+    )
 
     center_shrink_axis(cax, width_scale=0.62, height_scale=0.75)
     if style_cfg.colorbar_pad:
@@ -3960,6 +4317,85 @@ def plot_simplified_qp_comparison_grid(
     return fig
 
 
+def plot_simplified_error_only_figure(
+    bundle,
+    style_cfg: FinalThreePanelStyleConfig,
+    panel_gap_ab=0.18,
+    alpha_colorbar_width_scale=0.5,
+    alpha_colorbar_height_scale=0.75,
+    legend_row_height=0.24,
+    tick_fs=None,
+    label_fs=None,
+    alpha_legend_fs=None,
+    title_fs=None,
+):
+    alphas = np.asarray(bundle["alphas"], dtype=float)
+    colors = _make_alpha_colors(alphas)
+    sizes = _resolve_plot_text_sizes(
+        style_cfg,
+        tick_fs=tick_fs,
+        label_fs=label_fs,
+        alpha_legend_fs=alpha_legend_fs,
+        title_fs=title_fs,
+    )
+    fig = plt.figure(figsize=(12.8, 4.8))
+    gs = fig.add_gridspec(
+        2,
+        3,
+        height_ratios=[1.0, legend_row_height],
+        width_ratios=[1.0, panel_gap_ab, 1.0],
+        hspace=0.14,
+        wspace=0.0,
+    )
+    ax_a = fig.add_subplot(gs[0, 0])
+    ax_b = fig.add_subplot(gs[0, 2])
+    cax = fig.add_subplot(gs[1, :])
+
+    for i, a in enumerate(alphas):
+        ax_a.plot(
+            bundle["mix_layers"],
+            bundle["mix_q_err_derf"][float(a)],
+            color=colors[i],
+            lw=style_cfg.line_width,
+        )
+        ax_b.plot(
+            bundle["mix_layers"],
+            bundle["mix_p_err_derf"][float(a)],
+            color=colors[i],
+            lw=style_cfg.line_width,
+        )
+    ax_a.plot(bundle["mix_layers"], bundle["mix_q_err_preln"], color="black", lw=style_cfg.line_width, zorder=10)
+    ax_b.plot(bundle["mix_layers"], bundle["mix_p_err_preln"], color="black", lw=style_cfg.line_width, zorder=10)
+
+    ax_a.set_title("(a) " + r"$|f_q-\tilde{p}|/f_q$", fontsize=sizes["title_fs"])
+    ax_b.set_title("(b) " + r"$|f_p-\tilde{p}|/f_p$", fontsize=sizes["title_fs"])
+    ax_a.set_xlabel(r"$b$", fontsize=sizes["label_fs"])
+    ax_b.set_xlabel(r"$b$", fontsize=sizes["label_fs"])
+    ax_a.set_ylabel("rel. error", fontsize=sizes["label_fs"])
+    ax_b.set_ylabel("rel. error", fontsize=sizes["label_fs"])
+    ax_a.set_yscale("log")
+    ax_b.set_yscale("log")
+    prettify_log_axis(ax_a, "y")
+    prettify_log_axis(ax_b, "y")
+    prettify_axes(ax_a)
+    prettify_axes(ax_b)
+    ax_a.tick_params(labelsize=sizes["tick_fs"])
+    ax_b.tick_params(labelsize=sizes["tick_fs"])
+
+    fig.subplots_adjust(left=0.09, right=0.985, bottom=0.11)
+
+    pos = cax.get_position()
+    new_w = pos.width * alpha_colorbar_width_scale
+    new_h = pos.height * alpha_colorbar_height_scale
+    new_x = pos.x0 + 0.5 * (pos.width - new_w)
+    new_y = pos.y0 + 0.5 * (pos.height - new_h) - style_cfg.colorbar_pad
+    cax.set_position([new_x, new_y, new_w, new_h])
+    _draw_alpha_preln_legend_like_equangular(cax, alphas, colors, sizes["alpha_legend_fs"])
+    _save_notebook_figure(fig, "simplified_error_only_figure.pdf")
+    plt.show()
+    return fig
+
+
 def run_cifar_fit_histograms(
     model_cfg: ModelConfig,
     mean_field_cfg: MeanFieldConfig,
@@ -3971,10 +4407,14 @@ def run_cifar_fit_histograms(
     std_threshold: float = 0.2,
     max_epochs_to_search: int = 20,
     j_num_draws: int = 10,
+    num_model_inits: int = 1,
     q0_values=None,
     p0_values=None,
     preln_scale_values=None,
     rescale_vit_preln_apjn: bool = False,
+    mask_all_p_values: bool = False,
+    deterministic: bool = False,
+    save_every_n_samples: int = 25,
     save_results: bool = False,
     save_root: str = "/content/drive/MyDrive/ml_projects/mapes_variance",
     rewrite: bool = True,
@@ -3983,7 +4423,11 @@ def run_cifar_fit_histograms(
     # Repeats inverse/direct fitting over multiple CIFAR samples.
     rng = np.random.default_rng()
     depth = int(model_cfg.depth)
-    loader_seed_random = int(rng.integers(0, 2**31 - 1))
+    if deterministic:
+        clear_cifar_experiment_cache()
+        loader_seed_random = int(batch_seed)
+    else:
+        loader_seed_random = int(rng.integers(0, 2**31 - 1))
     inverse_layers = tuple(
         l for l in range(0, depth + 1, int(layer_stride))
         if 0 < int(l) < depth
@@ -4005,13 +4449,56 @@ def run_cifar_fit_histograms(
         preln_scale_num=61,
         refine_radius=0.2,
         rescale_vit_preln_apjn=bool(rescale_vit_preln_apjn),
+        mask_all_p_values=bool(mask_all_p_values),
     )
 
     inverse_mape = []
     direct_mape = []
     sample_summaries = []
+    saved_path = None
+    has_checkpointed = False
+
+    def _current_output_bundle():
+        return {
+            "inverse_mape": np.asarray(inverse_mape, dtype=float),
+            "direct_mape": np.asarray(direct_mape, dtype=float),
+            "samples": list(sample_summaries),
+            "depth": int(depth),
+            "layer_stride": int(layer_stride),
+            "alphas": np.asarray(alphas, dtype=float),
+            "config": {
+                "n_samples": int(n_samples),
+                "batch_seed": None,
+                "loader_seed_random": int(loader_seed_random),
+                "std_threshold": float(std_threshold),
+                "max_epochs_to_search": int(max_epochs_to_search),
+                "j_num_draws": int(j_num_draws),
+                "num_model_inits": int(num_model_inits),
+                "randomized_sampling": not bool(deterministic),
+                "rescale_vit_preln_apjn": bool(rescale_vit_preln_apjn),
+                "mask_all_p_values": bool(mask_all_p_values),
+                "deterministic": bool(deterministic),
+                "save_every_n_samples": int(save_every_n_samples),
+            },
+        }
 
     for draw_index in tqdm(range(int(n_samples)), desc="run_cifar_fit_histograms", leave=False):
+        if deterministic and draw_index < 2:
+            seed_all(loader_seed_random + int(draw_index))
+            preview_samples, _, _ = get_cifar_batch(
+                batch_size=1,
+                img_size=model_cfg.img_size,
+                num_classes=model_cfg.num_classes,
+                loader_seed=loader_seed_random,
+                draw_index=int(draw_index),
+                std_threshold=float(std_threshold),
+                max_epochs_to_search=int(max_epochs_to_search),
+            )
+            preview_vals = preview_samples.reshape(-1)[:8].detach().cpu().numpy()
+            print(
+                f"[deterministic preview] draw_index={draw_index} "
+                f"first8={np.array2string(preview_vals, precision=5, separator=', ')}"
+            )
         apjn_cfg = APJNCifarConfig(
             input_source="cifar",
             batch_size=1,
@@ -4025,9 +4512,14 @@ def run_cifar_fit_histograms(
             alphas=tuple(np.asarray(alphas, dtype=float)),
             j_num_draws=int(j_num_draws),
             j_normalize_by="Y",
-            num_model_inits=1,
+            num_model_inits=int(num_model_inits),
         )
-        model_cfg_draw = replace(model_cfg, seed=int(rng.integers(0, 2**31 - 1)))
+        model_seed = (
+            int(model_cfg.seed) + int(draw_index) * int(num_model_inits)
+            if deterministic
+            else int(rng.integers(0, 2**31 - 1))
+        )
+        model_cfg_draw = replace(model_cfg, seed=model_seed)
         bundle = run_cifar_apjn_experiment(model_cfg_draw, apjn_cfg)
         inv_fit = fit_theory_for_apjn(bundle, fit_cfg, mean_field_cfg)
         panel_d_cfg = PanelDConfig(
@@ -4051,24 +4543,24 @@ def run_cifar_fit_histograms(
             "batch_meta": bundle.get("batch_meta"),
         })
 
-    out = {
-        "inverse_mape": np.asarray(inverse_mape, dtype=float),
-        "direct_mape": np.asarray(direct_mape, dtype=float),
-        "samples": sample_summaries,
-        "depth": int(depth),
-        "layer_stride": int(layer_stride),
-        "alphas": np.asarray(alphas, dtype=float),
-        "config": {
-            "n_samples": int(n_samples),
-            "batch_seed": None,
-            "loader_seed_random": int(loader_seed_random),
-            "std_threshold": float(std_threshold),
-            "max_epochs_to_search": int(max_epochs_to_search),
-            "j_num_draws": int(j_num_draws),
-            "randomized_sampling": True,
-            "rescale_vit_preln_apjn": bool(rescale_vit_preln_apjn),
-        },
-    }
+        if save_results and int(save_every_n_samples) > 0 and ((draw_index + 1) % int(save_every_n_samples) == 0):
+            saved_path, merged_out = _save_bundle_pickle(
+                _current_output_bundle(),
+                save_root=save_root,
+                folder_name=_folder_name_with_postfix(
+                    f"fit_hist_depth{depth}_stride{int(layer_stride)}",
+                    result_postfix,
+                ),
+                filename="results.pkl",
+                rewrite=(True if has_checkpointed else bool(rewrite)),
+                merge_kind="fit_hist",
+            )
+            inverse_mape[:] = np.asarray(merged_out["inverse_mape"], dtype=float).tolist()
+            direct_mape[:] = np.asarray(merged_out["direct_mape"], dtype=float).tolist()
+            sample_summaries[:] = list(merged_out["samples"])
+            has_checkpointed = True
+
+    out = _current_output_bundle()
     if save_results:
         saved_path, out = _save_bundle_pickle(
             out,
@@ -4078,7 +4570,7 @@ def run_cifar_fit_histograms(
                 result_postfix,
             ),
             filename="results.pkl",
-            rewrite=bool(rewrite),
+            rewrite=(True if has_checkpointed else bool(rewrite)),
             merge_kind="fit_hist",
         )
         out["saved_path"] = str(saved_path)
@@ -4325,10 +4817,21 @@ def prepare_fit_and_scatter_plot_data(
     inverse_scatter_bundle,
     direct_scatter_bundle,
 ):
+    fit_loaded = _maybe_load_bundle(fit_bundle)
+    inverse_loaded = _maybe_load_bundle(inverse_scatter_bundle)
+    direct_loaded = _maybe_load_bundle(direct_scatter_bundle)
+
+    if isinstance(fit_bundle, (str, Path)):
+        print(f"Restored fit bundle from results.pkl: {_count_bundle_samples(fit_loaded)} samples")
+    if isinstance(inverse_scatter_bundle, (str, Path)):
+        print(f"Restored inverse-scatter bundle from results.pkl: {_count_bundle_samples(inverse_loaded)} samples")
+    if isinstance(direct_scatter_bundle, (str, Path)):
+        print(f"Restored direct-scatter bundle from results.pkl: {_count_bundle_samples(direct_loaded)} samples")
+
     return {
-        "fit_bundle": _maybe_load_bundle(fit_bundle),
-        "inverse_scatter_bundle": _maybe_load_bundle(inverse_scatter_bundle),
-        "direct_scatter_bundle": _maybe_load_bundle(direct_scatter_bundle),
+        "fit_bundle": fit_loaded,
+        "inverse_scatter_bundle": inverse_loaded,
+        "direct_scatter_bundle": direct_loaded,
     }
 
 
@@ -4338,6 +4841,8 @@ def plot_fit_and_scatter_figure(
     panel_col_gap=0.18,
     panel_row_gap=0.22,
     lower_row_to_colorbar_gap=0.18,
+    legend_width_scale=0.82,
+    legend_height_scale=0.75,
     tick_fs=None,
     label_fs=None,
     alpha_legend_fs=None,
@@ -4449,7 +4954,7 @@ def plot_fit_and_scatter_figure(
     prettify_axes(ax_d)
     ax_d.tick_params(labelsize=sizes["tick_fs"])
 
-    center_shrink_axis(cax, width_scale=0.82, height_scale=0.75)
+    center_shrink_axis(cax, width_scale=legend_width_scale, height_scale=legend_height_scale)
     if style_cfg.colorbar_pad:
         pos = cax.get_position()
         cax.set_position([pos.x0, pos.y0 - style_cfg.colorbar_pad, pos.width, pos.height])

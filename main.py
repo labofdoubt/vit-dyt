@@ -152,6 +152,18 @@ def apply_learnable_post_norm_scale_vit(model: nn.Module, init_value: float):
     _wrap(model)
 
 
+def apply_learnable_post_fc_norm_scale_vit(model: nn.Module, init_value: float):
+    """
+    Wrap only ViT `fc_norm` so its output is multiplied by a learnable scalar.
+    """
+    if not hasattr(model, "fc_norm"):
+        raise ValueError("Post-fc_norm learnable scaling currently supports ViT models with an `fc_norm` attribute.")
+    if isinstance(model.fc_norm, nn.Sequential) and any(isinstance(child, LearnablePostNormScale) for child in model.fc_norm.children()):
+        return
+
+    model.fc_norm = nn.Sequential(model.fc_norm, LearnablePostNormScale(init_value))
+
+
 def scale_vit_mlp_init_std(model: nn.Module, multiplier: float):
     """
     Multiply the weights of each ViT block's MLP fc1/fc2 layers by `multiplier`.
@@ -273,6 +285,10 @@ def get_args_parser():
                         help='If true, multiply the output of each ViT normalization module by a learnable scalar parameter.')
     parser.add_argument('--learnable_post_layernorm_scale_init_value', type=float, default=1.0,
                         help='Initialization value for each learnable post-layernorm scale.')
+    parser.add_argument('--use_learnable_post_fc_norm_scale', type=str2bool, default=False,
+                        help='If true, multiply only the output of ViT fc_norm by a learnable scalar parameter.')
+    parser.add_argument('--learnable_post_fc_norm_scale_init_value', type=float, default=1.0,
+                        help='Initialization value for the learnable post-fc_norm scale.')
     parser.add_argument('--use_mlp_init_std_multiplier', type=str2bool, default=False,
                         help='If true, multiply ViT MLP fc1/fc2 weight std by a fixed coefficient right after initialization.')
     parser.add_argument('--mlp_init_std_multiplier', type=float, default=None,
@@ -597,12 +613,21 @@ def main(args):
         if "vit" not in args.model:
             raise ValueError("--block_layernorm_gamma_init_value currently supports ViT models only.")
         set_vit_block_norm_gamma_init(model, value=args.block_layernorm_gamma_init_value)
+    if args.use_learnable_post_layernorm_scale and args.use_learnable_post_fc_norm_scale:
+        raise ValueError("Choose only one of --use_learnable_post_layernorm_scale or --use_learnable_post_fc_norm_scale")
     if args.use_learnable_post_layernorm_scale:
         if "vit" not in args.model:
             raise ValueError("--use_learnable_post_layernorm_scale currently supports ViT models only.")
         apply_learnable_post_norm_scale_vit(
             model,
             init_value=args.learnable_post_layernorm_scale_init_value,
+        )
+    if args.use_learnable_post_fc_norm_scale:
+        if "vit" not in args.model:
+            raise ValueError("--use_learnable_post_fc_norm_scale currently supports ViT models only.")
+        apply_learnable_post_fc_norm_scale_vit(
+            model,
+            init_value=args.learnable_post_fc_norm_scale_init_value,
         )
     if args.use_residual_branch_scale and args.use_learnable_residual_branch_scale:
         raise ValueError("Choose only one of --use_residual_branch_scale or --use_learnable_residual_branch_scale")
