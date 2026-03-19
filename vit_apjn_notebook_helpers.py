@@ -1364,6 +1364,37 @@ def build_vit(model_cfg: ModelConfig, *, use_derf: bool):
     model.eval().to(DEVICE)
     return model
 
+
+def scale_vit_value_attn_init_std(model: nn.Module, multiplier: float):
+    if float(multiplier) <= 0.0:
+        raise ValueError("Attention multiplier must be positive.")
+    if abs(float(multiplier) - 1.0) < 1e-12:
+        return model
+    if not hasattr(model, "blocks"):
+        raise ValueError("This scaling utility expects a ViT with a `blocks` attribute.")
+
+    with torch.no_grad():
+        for bi, block in enumerate(model.blocks):
+            attn = getattr(block, "attn", None)
+            if attn is None:
+                continue
+
+            qkv = getattr(attn, "qkv", None)
+            if isinstance(qkv, nn.Linear):
+                out_dim = int(qkv.weight.shape[0])
+                if out_dim % 3 != 0:
+                    raise ValueError(
+                        f"Block {bi}: expected qkv.weight first dim divisible by 3, got {out_dim}."
+                    )
+                third = out_dim // 3
+                qkv.weight[2 * third : 3 * third].mul_(float(multiplier))
+
+            proj = getattr(attn, "proj", None)
+            if isinstance(proj, nn.Linear):
+                proj.weight.mul_(float(multiplier))
+
+    return model
+
 @torch.no_grad()
 def set_all_derf_alpha_(model: nn.Module, alpha_value: float) -> int:
     _DynamicErf, _ = _ensure_dynamic_tanh()
@@ -1613,6 +1644,51 @@ def get_synth_images_batch(batch_size: int, img_size: int, num_classes: int):
     samples = torch.randn(batch_size, 3, img_size, img_size, dtype=torch.float32)
     targets = torch.randint(low=0, high=num_classes, size=(batch_size,), dtype=torch.long)
     return samples, targets, {"kind": "synthetic_images"}
+
+
+def restore_cifar_fit_hist_sample(
+    model_cfg: ModelConfig,
+    *,
+    batch_seed: int,
+    sample_index: int,
+    std_threshold: float = 0.0,
+    max_epochs_to_search: int = 20,
+    batch_size: int = 1,
+    clear_cache: bool = True,
+    print_preview: bool = True,
+):
+    if clear_cache:
+        clear_cifar_experiment_cache()
+    seed_all(int(batch_seed) + int(sample_index))
+    samples, targets, batch_meta = get_cifar_batch(
+        batch_size=int(batch_size),
+        img_size=model_cfg.img_size,
+        num_classes=model_cfg.num_classes,
+        loader_seed=int(batch_seed),
+        draw_index=int(sample_index),
+        std_threshold=float(std_threshold),
+        max_epochs_to_search=int(max_epochs_to_search),
+    )
+    preview_vals = samples.reshape(-1)[:8].detach().cpu().numpy()
+    if print_preview:
+        target_preview = int(targets.reshape(-1)[0].item()) if targets.numel() else None
+        print(
+            f"[cifar sample restore] sample_index={int(sample_index)} "
+            f"target={target_preview} shape={tuple(samples.shape)}"
+        )
+        print(
+            "[cifar sample restore] first8="
+            + np.array2string(preview_vals, precision=5, separator=", ")
+        )
+        print(f"[cifar sample restore] meta={dict(batch_meta)}")
+    return {
+        "samples": samples,
+        "targets": targets,
+        "batch_meta": dict(batch_meta),
+        "preview_first8": preview_vals.copy(),
+        "sample_index": int(sample_index),
+        "batch_seed": int(batch_seed),
+    }
 
 
 def make_apjn_equiangular_block0_batch(
@@ -1987,6 +2063,47 @@ def collect_block0_input_stats(model: nn.Module, images: torch.Tensor, block0_in
     }
 
 
+def collect_restored_cifar_block0_dot_stats(
+    model_cfg: ModelConfig,
+    *,
+    batch_seed: int,
+    sample_index: int,
+    use_derf: bool = False,
+    alpha: float | None = None,
+    std_threshold: float = 0.0,
+    max_epochs_to_search: int = 20,
+    clear_cache: bool = True,
+    print_preview: bool = True,
+):
+    restored = restore_cifar_fit_hist_sample(
+        model_cfg,
+        batch_seed=int(batch_seed),
+        sample_index=int(sample_index),
+        std_threshold=float(std_threshold),
+        max_epochs_to_search=int(max_epochs_to_search),
+        batch_size=1,
+        clear_cache=bool(clear_cache),
+        print_preview=bool(print_preview),
+    )
+    seed_all(int(model_cfg.seed))
+    cuda_cleanup()
+    model = build_vit(model_cfg, use_derf=bool(use_derf))
+    try:
+        if bool(use_derf) and alpha is not None:
+            set_all_derf_alpha_(model, float(alpha))
+        block0_stats = collect_block0_input_stats(model, restored["samples"])
+    finally:
+        del model
+        cuda_cleanup()
+    return {
+        **restored,
+        "model_kind": "derf" if bool(use_derf) else "preln",
+        "alpha": None if alpha is None else float(alpha),
+        "token_sqnorm_over_d": np.asarray(block0_stats["token_sqnorm_over_d"], dtype=float),
+        "pairwise_dot_over_d": np.asarray(block0_stats["pairwise_dot_over_d"], dtype=float),
+    }
+
+
 def plot_block0_stats_histograms(block0_stats, *, figure_title="Distributions of inputs to transformer block 1"):
     token_vals = np.asarray(block0_stats["token_sqnorm_over_d"], dtype=float)
     pairwise_vals = np.asarray(block0_stats["pairwise_dot_over_d"], dtype=float)
@@ -2013,6 +2130,14 @@ def plot_block0_stats_histograms(block0_stats, *, figure_title="Distributions of
     fig.suptitle(figure_title, y=1.02)
     fig.tight_layout()
     plt.show()
+
+
+def plot_restored_cifar_block0_dot_histograms(
+    block0_stats,
+    *,
+    figure_title="Distributions of inputs to transformer block 1",
+):
+    return plot_block0_stats_histograms(block0_stats, figure_title=figure_title)
 
 
 def preview_apjn_sample_stats(model_cfg: ModelConfig, apjn_cfg: APJNCifarConfig):
@@ -4423,6 +4548,11 @@ def run_cifar_fit_histograms(
     # Repeats inverse/direct fitting over multiple CIFAR samples.
     rng = np.random.default_rng()
     depth = int(model_cfg.depth)
+    folder_name = _folder_name_with_postfix(
+        f"fit_hist_depth{depth}_stride{int(layer_stride)}",
+        result_postfix,
+    )
+    existing_results_path = Path(save_root) / folder_name / "results.pkl"
     if deterministic:
         clear_cifar_experiment_cache()
         loader_seed_random = int(batch_seed)
@@ -4457,6 +4587,22 @@ def run_cifar_fit_histograms(
     sample_summaries = []
     saved_path = None
     has_checkpointed = False
+    start_index = 0
+
+    if save_results and (not rewrite) and existing_results_path.exists():
+        existing_bundle = load_saved_bundle(existing_results_path)
+        inverse_mape = np.asarray(existing_bundle.get("inverse_mape", []), dtype=float).tolist()
+        direct_mape = np.asarray(existing_bundle.get("direct_mape", []), dtype=float).tolist()
+        sample_summaries = list(existing_bundle.get("samples", []))
+        start_index = len(sample_summaries)
+        saved_cfg = existing_bundle.get("config", {}) if isinstance(existing_bundle, dict) else {}
+        if "loader_seed_random" in saved_cfg and saved_cfg["loader_seed_random"] is not None:
+            loader_seed_random = int(saved_cfg["loader_seed_random"])
+        has_checkpointed = True
+        print(
+            f"Resuming run_cifar_fit_histograms from existing results: "
+            f"{start_index} samples already saved in {existing_results_path}"
+        )
 
     def _current_output_bundle():
         return {
@@ -4482,8 +4628,16 @@ def run_cifar_fit_histograms(
             },
         }
 
-    for draw_index in tqdm(range(int(n_samples)), desc="run_cifar_fit_histograms", leave=False):
-        if deterministic and draw_index < 2:
+    if start_index >= int(n_samples):
+        out = _current_output_bundle()
+        if save_results:
+            out["saved_path"] = str(existing_results_path)
+        return out
+
+    preview_indices = set(range(start_index, min(int(n_samples), start_index + 2)))
+
+    for draw_index in tqdm(range(start_index, int(n_samples)), desc="run_cifar_fit_histograms", leave=False):
+        if draw_index in preview_indices:
             seed_all(loader_seed_random + int(draw_index))
             preview_samples, _, _ = get_cifar_batch(
                 batch_size=1,
@@ -4496,7 +4650,7 @@ def run_cifar_fit_histograms(
             )
             preview_vals = preview_samples.reshape(-1)[:8].detach().cpu().numpy()
             print(
-                f"[deterministic preview] draw_index={draw_index} "
+                f"[resume preview] draw_index={draw_index} "
                 f"first8={np.array2string(preview_vals, precision=5, separator=', ')}"
             )
         apjn_cfg = APJNCifarConfig(
@@ -4547,12 +4701,9 @@ def run_cifar_fit_histograms(
             saved_path, merged_out = _save_bundle_pickle(
                 _current_output_bundle(),
                 save_root=save_root,
-                folder_name=_folder_name_with_postfix(
-                    f"fit_hist_depth{depth}_stride{int(layer_stride)}",
-                    result_postfix,
-                ),
+                folder_name=folder_name,
                 filename="results.pkl",
-                rewrite=(True if has_checkpointed else bool(rewrite)),
+                rewrite=True,
                 merge_kind="fit_hist",
             )
             inverse_mape[:] = np.asarray(merged_out["inverse_mape"], dtype=float).tolist()
@@ -4565,12 +4716,275 @@ def run_cifar_fit_histograms(
         saved_path, out = _save_bundle_pickle(
             out,
             save_root=save_root,
-            folder_name=_folder_name_with_postfix(
-                f"fit_hist_depth{depth}_stride{int(layer_stride)}",
-                result_postfix,
-            ),
+            folder_name=folder_name,
             filename="results.pkl",
-            rewrite=(True if has_checkpointed else bool(rewrite)),
+            rewrite=True,
+            merge_kind="fit_hist",
+        )
+        out["saved_path"] = str(saved_path)
+    return out
+
+
+def run_cifar_inverse_apjn_points(
+    model_cfg: ModelConfig,
+    *,
+    alphas,
+    n_samples: int = 16,
+    num_layers: int = 4,
+    batch_seed: int = 0,
+    std_threshold: float = 0.2,
+    max_epochs_to_search: int = 20,
+    j_num_draws: int = 10,
+    num_model_inits: int = 1,
+    deterministic: bool = False,
+    attn_mult: float = 1.0,
+    save_every_n_samples: int = 25,
+    save_results: bool = False,
+    save_root: str = "/content/drive/MyDrive/ml_projects/mapes_variance",
+    rewrite: bool = True,
+    result_postfix: str = "",
+):
+    rng = np.random.default_rng()
+    depth = int(model_cfg.depth)
+    folder_name = _folder_name_with_postfix(
+        f"inverse_points_depth{depth}_nlayers{int(num_layers)}",
+        result_postfix,
+    )
+    existing_results_path = Path(save_root) / folder_name / "results.pkl"
+
+    if deterministic:
+        clear_cifar_experiment_cache()
+        loader_seed_random = int(batch_seed)
+        layer_choice_seed_base = int(batch_seed) + 100_003
+        model_seed_base = int(model_cfg.seed)
+    else:
+        loader_seed_random = int(rng.integers(0, 2**31 - 1))
+        layer_choice_seed_base = int(rng.integers(0, 2**31 - 1))
+        model_seed_base = int(rng.integers(0, 2**31 - 1))
+
+    inverse_mape = []
+    direct_mape = []
+    sample_summaries = []
+    saved_path = None
+    start_index = 0
+
+    if save_results and (not rewrite) and existing_results_path.exists():
+        existing_bundle = load_saved_bundle(existing_results_path)
+        inverse_mape = np.asarray(existing_bundle.get("inverse_mape", []), dtype=float).tolist()
+        direct_mape = np.asarray(existing_bundle.get("direct_mape", []), dtype=float).tolist()
+        sample_summaries = list(existing_bundle.get("samples", []))
+        start_index = len(sample_summaries)
+        saved_cfg = existing_bundle.get("config", {}) if isinstance(existing_bundle, dict) else {}
+        if "loader_seed_random" in saved_cfg and saved_cfg["loader_seed_random"] is not None:
+            loader_seed_random = int(saved_cfg["loader_seed_random"])
+        if "layer_choice_seed_base" in saved_cfg and saved_cfg["layer_choice_seed_base"] is not None:
+            layer_choice_seed_base = int(saved_cfg["layer_choice_seed_base"])
+        if "model_seed_base" in saved_cfg and saved_cfg["model_seed_base"] is not None:
+            model_seed_base = int(saved_cfg["model_seed_base"])
+        print(
+            f"Resuming run_cifar_inverse_apjn_points from existing results: "
+            f"{start_index} samples already saved in {existing_results_path}"
+        )
+
+    candidate_layers = np.arange(1, max(depth, 1), dtype=int)
+    if candidate_layers.size == 0:
+        raise ValueError("Need depth >= 2 to sample internal inverse-APJN layers.")
+
+    def _current_output_bundle():
+        return {
+            "inverse_mape": np.asarray(inverse_mape, dtype=float),
+            "direct_mape": np.asarray(direct_mape, dtype=float),
+            "samples": list(sample_summaries),
+            "depth": int(depth),
+            "layer_stride": None,
+            "num_layers": int(num_layers),
+            "alphas": np.asarray(alphas, dtype=float),
+            "config": {
+                "n_samples": int(n_samples),
+                "batch_seed": None,
+                "loader_seed_random": int(loader_seed_random),
+                "layer_choice_seed_base": int(layer_choice_seed_base),
+                "model_seed_base": int(model_seed_base),
+                "std_threshold": float(std_threshold),
+                "max_epochs_to_search": int(max_epochs_to_search),
+                "j_num_draws": int(j_num_draws),
+                "num_model_inits": int(num_model_inits),
+                "randomized_sampling": not bool(deterministic),
+                "deterministic": bool(deterministic),
+                "save_every_n_samples": int(save_every_n_samples),
+                "attn_mult": float(attn_mult),
+                "inverse_only": True,
+            },
+        }
+
+    if start_index >= int(n_samples):
+        out = _current_output_bundle()
+        if save_results:
+            out["saved_path"] = str(existing_results_path)
+        return out
+
+    preview_indices = set(range(start_index, min(int(n_samples), start_index + 2)))
+
+    def _placeholder_direct_fit():
+        return {
+            "metric": None,
+            "q0": None,
+            "p0": None,
+            "value": float("nan"),
+            "preln_scale_C": 1.0,
+            "vit_points": {"preln": {}, "derf": {}},
+        }
+
+    def _sample_layers_for_draw(draw_index: int):
+        local_rng = np.random.default_rng(int(layer_choice_seed_base) + int(draw_index))
+        layer_count = min(int(num_layers), candidate_layers.size)
+        return tuple(sorted(int(x) for x in local_rng.choice(candidate_layers, size=layer_count, replace=False)))
+
+    def _build_sample_inverse_payload(bundle, chosen_layers):
+        x_shift = np.asarray([int(l) - 1 for l in chosen_layers], dtype=int)
+        preln_raw = {int(k): float(v) for k, v in bundle["preln_with_J"]["J_raw"].items()}
+        derf_payload = {}
+        for result in bundle["derf_pack_with_J"]["results"]:
+            a_float = float(result["alpha"])
+            raw = {int(k): float(v) for k, v in result["J_raw"].items()}
+            derf_payload[a_float] = np.asarray([raw.get(int(l), np.nan) for l in chosen_layers], dtype=float)
+        return {
+            "metric": None,
+            "mask_all_p_values": False,
+            "q0": None,
+            "p0": None,
+            "value": float("nan"),
+            "vit_points": {
+                "x_shift": x_shift,
+                "preln": np.asarray([preln_raw.get(int(l), np.nan) for l in chosen_layers], dtype=float),
+                "derf": derf_payload,
+            },
+            "chosen_layers": tuple(int(l) for l in chosen_layers),
+        }
+
+    alpha_list = tuple(np.asarray(alphas, dtype=float))
+
+    for draw_index in tqdm(range(start_index, int(n_samples)), desc="run_cifar_inverse_apjn_points", leave=False):
+        chosen_layers = _sample_layers_for_draw(draw_index)
+        if draw_index in preview_indices:
+            seed_all(loader_seed_random + int(draw_index))
+            preview_samples, _, _ = get_cifar_batch(
+                batch_size=1,
+                img_size=model_cfg.img_size,
+                num_classes=model_cfg.num_classes,
+                loader_seed=loader_seed_random,
+                draw_index=int(draw_index),
+                std_threshold=float(std_threshold),
+                max_epochs_to_search=int(max_epochs_to_search),
+            )
+            preview_vals = preview_samples.reshape(-1)[:8].detach().cpu().numpy()
+            print(
+                f"[resume preview] draw_index={draw_index} layers={chosen_layers} "
+                f"first8={np.array2string(preview_vals, precision=5, separator=', ')}"
+            )
+
+        seed_all(loader_seed_random + int(draw_index))
+        samples, targets, batch_meta = get_cifar_batch(
+            batch_size=1,
+            img_size=model_cfg.img_size,
+            num_classes=model_cfg.num_classes,
+            loader_seed=loader_seed_random,
+            draw_index=int(draw_index),
+            std_threshold=float(std_threshold),
+            max_epochs_to_search=int(max_epochs_to_search),
+        )
+
+        preln_runs = []
+        derf_runs = {float(a): [] for a in alpha_list}
+        seq_len = None
+        embed_dim = None
+        for init_idx in range(max(1, int(num_model_inits))):
+            init_seed = int(model_seed_base) + int(draw_index) * max(1, int(num_model_inits)) + int(init_idx)
+            model_cfg_draw = replace(model_cfg, seed=init_seed)
+            seed_all(init_seed)
+            cuda_cleanup()
+
+            preln_model = build_vit(model_cfg_draw, use_derf=False)
+            scale_vit_value_attn_init_std(preln_model, float(attn_mult))
+            derf_model = build_vit(model_cfg_draw, use_derf=True)
+            scale_vit_value_attn_init_std(derf_model, float(attn_mult))
+            try:
+                if seq_len is None or embed_dim is None:
+                    seq_len, embed_dim = get_vit_seq_len_and_dim(preln_model)
+                preln_runs.append(
+                    estimate_J_points_hutchinson(
+                        preln_model,
+                        samples,
+                        l0_list=chosen_layers,
+                        j_num_draws=int(j_num_draws),
+                        j_normalize_by="Y",
+                    )
+                )
+                for a in alpha_list:
+                    a_float = float(a)
+                    set_all_derf_alpha_(derf_model, a_float)
+                    derf_runs[a_float].append(
+                        estimate_J_points_hutchinson(
+                            derf_model,
+                            samples,
+                            l0_list=chosen_layers,
+                            j_num_draws=int(j_num_draws),
+                            j_normalize_by="Y",
+                        )
+                    )
+            finally:
+                del preln_model
+                del derf_model
+                cuda_cleanup()
+
+        bundle = {
+            "model_cfg": cfg_to_dict(model_cfg_draw),
+            "batch_meta": batch_meta,
+            "depth": int(depth),
+            "seq_len": int(seq_len) if seq_len is not None else 0,
+            "embed_dim": int(embed_dim) if embed_dim is not None else 0,
+            "preln_with_J": {"J_raw": _average_scalar_dicts(preln_runs) if preln_runs else {}},
+            "derf_pack_with_J": {
+                "alphas": np.asarray(alpha_list, dtype=float).copy(),
+                "results": [
+                    {
+                        "alpha": float(a),
+                        "J_raw": _average_scalar_dicts(derf_runs[float(a)]) if derf_runs[float(a)] else {},
+                    }
+                    for a in alpha_list
+                ],
+            },
+            "num_model_inits": int(max(1, int(num_model_inits))),
+        }
+
+        sample_summaries.append({
+            "draw_index": int(draw_index),
+            "inverse_fit": _build_sample_inverse_payload(bundle, chosen_layers),
+            "direct_fit": _placeholder_direct_fit(),
+            "batch_meta": batch_meta,
+        })
+
+        if save_results and int(save_every_n_samples) > 0 and ((draw_index + 1) % int(save_every_n_samples) == 0):
+            saved_path, merged_out = _save_bundle_pickle(
+                _current_output_bundle(),
+                save_root=save_root,
+                folder_name=folder_name,
+                filename="results.pkl",
+                rewrite=True,
+                merge_kind="fit_hist",
+            )
+            inverse_mape[:] = np.asarray(merged_out["inverse_mape"], dtype=float).tolist()
+            direct_mape[:] = np.asarray(merged_out["direct_mape"], dtype=float).tolist()
+            sample_summaries[:] = list(merged_out["samples"])
+
+    out = _current_output_bundle()
+    if save_results:
+        saved_path, out = _save_bundle_pickle(
+            out,
+            save_root=save_root,
+            folder_name=folder_name,
+            filename="results.pkl",
+            rewrite=True,
             merge_kind="fit_hist",
         )
         out["saved_path"] = str(saved_path)
@@ -4835,6 +5249,310 @@ def prepare_fit_and_scatter_plot_data(
     }
 
 
+def refit_fit_scatter_plot_data(
+    fit_scatter_plot_data,
+    mean_field_cfg: MeanFieldConfig,
+    *,
+    n_tokens: int,
+    q0_values,
+    p0_values,
+    c_values,
+    metric: str = "mape",
+    fit_pre_ln: bool = True,
+    mask_all_p_values: bool = False,
+):
+    if not isinstance(fit_scatter_plot_data, dict) or "fit_bundle" not in fit_scatter_plot_data:
+        raise TypeError(
+            "refit_fit_scatter_plot_data expects the result of "
+            "prepare_fit_and_scatter_plot_data(...)."
+        )
+
+    fit_bundle = fit_scatter_plot_data["fit_bundle"]
+    alphas = np.asarray(fit_bundle["alphas"], dtype=float)
+    depth = int(fit_bundle["depth"])
+    q0_values = _resolve_grid_values(q0_values, len(q0_values))
+    p0_values = _resolve_grid_values(p0_values, len(p0_values))
+    c_values = _resolve_grid_values(c_values, len(c_values))
+    metric = str(metric).lower()
+    mask_all_p_values = bool(mask_all_p_values)
+    q_mesh, p_mesh = np.meshgrid(q0_values, p0_values, indexing="xy")
+    valid_mask = p_mesh <= q_mesh + 1e-12
+    if not np.any(valid_mask):
+        raise RuntimeError("No valid (q0, p0) pairs satisfy p0 <= q0.")
+    valid_linear_idx = np.flatnonzero(valid_mask.reshape(-1))
+    linear_to_valid = {int(lin): idx for idx, lin in enumerate(valid_linear_idx.tolist())}
+    q_valid = q_mesh[valid_mask]
+    p_valid = p_mesh[valid_mask]
+
+    preln_grid_full = simulate_recursions_full_grid(
+        num_layers=depth,
+        q0_grid=q_valid,
+        p0_grid=p_valid,
+        n_tokens=n_tokens,
+        mode="layernorm",
+        sigma_w1=mean_field_cfg.sigma_w1,
+        sigma_w2=mean_field_cfg.sigma_w2,
+        sigma_o=mean_field_cfg.sigma_o,
+        sigma_v=mean_field_cfg.sigma_v,
+        sigma_a=mean_field_cfg.sigma_a,
+        mask_all_p_values=mask_all_p_values,
+    )
+    derf_grid_full = {
+        float(a): simulate_recursions_full_grid(
+            num_layers=depth,
+            q0_grid=q_valid,
+            p0_grid=p_valid,
+            n_tokens=n_tokens,
+            mode="erf",
+            alpha=float(a),
+            sigma_w1=mean_field_cfg.sigma_w1,
+            sigma_w2=mean_field_cfg.sigma_w2,
+            sigma_o=mean_field_cfg.sigma_o,
+            sigma_v=mean_field_cfg.sigma_v,
+            sigma_a=mean_field_cfg.sigma_a,
+            mask_all_p_values=mask_all_p_values,
+        )
+        for a in alphas
+    }
+
+    def _slice_row(grid_dict, row_idx: int):
+        out = {}
+        for key, value in grid_dict.items():
+            arr = np.asarray(value)
+            out[key] = arr[int(row_idx)].copy() if arr.ndim >= 2 else arr.copy()
+        return out
+
+    def _theory_bundle_from_valid_idx(valid_idx: int):
+        return {
+            "l": np.arange(depth + 1, dtype=int),
+            "preln": _slice_row(preln_grid_full, valid_idx),
+            "derf": {float(a): _slice_row(derf_grid_full[float(a)], valid_idx) for a in alphas},
+        }
+
+    def _grid_metric(vit_vals, th_vals):
+        vit_vals = np.asarray(vit_vals, dtype=float)
+        th_vals = np.asarray(th_vals, dtype=float)
+        if metric == "mape":
+            return np.mean(
+                np.abs(th_vals - vit_vals[None, :]) / np.maximum(np.abs(vit_vals[None, :]), 1e-12),
+                axis=1,
+            )
+        if metric == "mse":
+            return np.mean((th_vals - vit_vals[None, :]) ** 2, axis=1)
+        raise ValueError("metric must be 'mape' or 'mse'")
+
+    def _inverse_refit(sample_fit):
+        vit_points = sample_fit["vit_points"]
+        x_shift = np.asarray(vit_points["x_shift"], dtype=int)
+        keep_layers = [int(x) + 1 for x in x_shift]
+        preln_vit = np.asarray(vit_points["preln"], dtype=float)
+        derf_vit = {float(a): np.asarray(vit_points["derf"][float(a)], dtype=float) for a in alphas}
+        metric_matrix = np.full(q_mesh.shape, np.nan, dtype=float)
+
+        metric_sum = _grid_metric(preln_vit, preln_grid_full["J"][:, keep_layers])
+        metric_count = np.ones_like(metric_sum)
+
+        for a in alphas:
+            a_float = float(a)
+            metric_sum += _grid_metric(derf_vit[a_float], derf_grid_full[a_float]["J"][:, keep_layers])
+            metric_count += 1.0
+
+        metric_matrix[valid_mask] = metric_sum / metric_count
+        best_flat = int(np.nanargmin(metric_matrix))
+        ip_best, iq_best = np.unravel_index(best_flat, metric_matrix.shape)
+        best_valid_idx = int(linear_to_valid[int(best_flat)])
+        theory_bundle = _theory_bundle_from_valid_idx(best_valid_idx)
+        panel_c_arrays = {
+            "x_shift": np.asarray(x_shift, dtype=int),
+            "preln_vit": preln_vit,
+            "preln_th": np.asarray([theory_bundle["preln"]["J"][l] for l in keep_layers], dtype=float),
+            "derf_vit": derf_vit,
+            "derf_th": {
+                float(a): np.asarray([theory_bundle["derf"][float(a)]["J"][l] for l in keep_layers], dtype=float)
+                for a in alphas
+            },
+        }
+        per_curve_metric = {
+            "preln": _fit_metric_value(panel_c_arrays["preln_vit"], panel_c_arrays["preln_th"], metric),
+            "derf": {
+                float(a): _fit_metric_value(panel_c_arrays["derf_vit"][float(a)], panel_c_arrays["derf_th"][float(a)], metric)
+                for a in alphas
+            },
+        }
+        return {
+            **sample_fit,
+            "metric": metric,
+            "mask_all_p_values": bool(mask_all_p_values),
+            "q0_values": q0_values,
+            "p0_values": p0_values,
+            "metric_matrix": metric_matrix,
+            "q0": float(q0_values[iq_best]),
+            "p0": float(p0_values[ip_best]),
+            "best_valid_idx": int(best_valid_idx),
+            "value": float(metric_matrix[ip_best, iq_best]),
+            "per_curve_metric": per_curve_metric,
+            "theory_bundle": theory_bundle,
+            "panel_c_arrays": panel_c_arrays,
+        }
+
+    def _direct_refit(sample_fit):
+        vit_points = sample_fit["vit_points"]
+        preln_subset = {int(l): float(v) for l, v in vit_points.get("preln", {}).items()}
+        derf_subset = {
+            float(a): {int(l): float(v) for l, v in vit_points["derf"][float(a)].items()}
+            for a in vit_points.get("derf", {}).keys()
+        }
+        rescale_vit_preln_apjn = bool(sample_fit.get("rescale_vit_preln_apjn", False))
+        fit_layers = max(
+            [0] + list(preln_subset.keys()) + [l for d in derf_subset.values() for l in d.keys()]
+        )
+
+        def _per_curve_direct_metric(theory_bundle, *, preln_data, derf_data, c_scale):
+            out = {"preln": None, "derf": {}}
+            if preln_data:
+                layer_ids = sorted(int(l) for l in preln_data.keys())
+                vit_vals = np.asarray([preln_data[l] for l in layer_ids], dtype=float)
+                th_vals = np.asarray([theory_bundle["preln"]["J_direct"][l] for l in layer_ids], dtype=float)
+                if c_scale != 1.0:
+                    scale_mask = np.asarray([int(l) >= 1 for l in layer_ids], dtype=float)
+                    th_vals = th_vals * (1.0 + (float(c_scale) - 1.0) * scale_mask)
+                out["preln"] = _fit_metric_value(vit_vals, th_vals, metric)
+            for a in alphas:
+                a_float = float(a)
+                if a_float not in derf_data:
+                    continue
+                layer_ids = sorted(int(l) for l in derf_data[a_float].keys())
+                vit_vals = np.asarray([derf_data[a_float][l] for l in layer_ids], dtype=float)
+                th_vals = np.asarray([theory_bundle["derf"][a_float]["J_direct"][l] for l in layer_ids], dtype=float)
+                out["derf"][a_float] = _fit_metric_value(vit_vals, th_vals, metric)
+            return out
+
+        if rescale_vit_preln_apjn and bool(fit_pre_ln):
+            derf_only = _direct_refit({
+                **sample_fit,
+                "vit_points": {"preln": {}, "derf": derf_subset},
+                "rescale_vit_preln_apjn": False,
+            })
+            theory_bundle = _theory_bundle_from_valid_idx(int(derf_only["best_valid_idx"]))
+            if 1 not in preln_subset:
+                raise RuntimeError("rescale_vit_preln_apjn=True requires pre-LN layer 1 in stored vit_points.")
+            vit_anchor = float(preln_subset[1])
+            theory_anchor = float(theory_bundle["preln"]["J_direct"][1])
+            preln_rescaled = {int(l): float(v) / vit_anchor * theory_anchor for l, v in preln_subset.items()}
+            preln_fit = {int(l): float(v) for l, v in preln_rescaled.items() if int(l) != 1}
+            refit = _direct_refit({
+                **sample_fit,
+                "vit_points": {"preln": preln_fit, "derf": derf_subset},
+                "rescale_vit_preln_apjn": False,
+            })
+            refit["rescale_vit_preln_apjn"] = True
+            refit["preln_rescaled_data"] = preln_rescaled
+            refit["preln_rescaled_fit_data"] = preln_fit
+            refit["preln_layer1_vit"] = vit_anchor
+            refit["preln_layer1_theory"] = theory_anchor
+            refit["preln_scale_C"] = None
+            return refit
+
+        derf_metric_sum = np.zeros(q_valid.shape[0], dtype=float)
+        derf_metric_count = 0.0
+
+        for a in alphas:
+            a_float = float(a)
+            if a_float not in derf_subset:
+                continue
+            layer_ids = sorted(int(l) for l in derf_subset[a_float].keys())
+            vit_vals = np.asarray([derf_subset[a_float][l] for l in layer_ids], dtype=float)
+            derf_metric_sum += _grid_metric(vit_vals, derf_grid_full[a_float]["J_direct"][:, layer_ids])
+            derf_metric_count += 1.0
+
+        use_preln_in_fit = bool(fit_pre_ln) and bool(preln_subset)
+        if use_preln_in_fit:
+            layer_ids = sorted(int(l) for l in preln_subset.keys())
+            vit_vals = np.asarray([preln_subset[l] for l in layer_ids], dtype=float)
+            base_th = preln_grid_full["J_direct"][:, layer_ids]
+            scale_mask = np.asarray([int(l) >= 1 for l in layer_ids], dtype=float)
+            scales = 1.0 + (np.asarray(c_values, dtype=float)[:, None] - 1.0) * scale_mask[None, :]
+            th_grid = base_th[:, None, :] * scales[None, :, :]
+            if metric == "mape":
+                preln_metric = np.mean(
+                    np.abs(th_grid - vit_vals[None, None, :]) / np.maximum(np.abs(vit_vals[None, None, :]), 1e-12),
+                    axis=2,
+                )
+            else:
+                preln_metric = np.mean((th_grid - vit_vals[None, None, :]) ** 2, axis=2)
+            overall_metric = (derf_metric_sum[:, None] + preln_metric) / max(derf_metric_count + 1.0, 1.0)
+            best_flat = int(np.nanargmin(overall_metric))
+            best_qp_idx, best_c_idx = np.unravel_index(best_flat, overall_metric.shape)
+            best_q0 = float(q_valid[best_qp_idx])
+            best_p0 = float(p_valid[best_qp_idx])
+            best_c = float(c_values[best_c_idx])
+            best_value = float(overall_metric[best_qp_idx, best_c_idx])
+            best_valid_idx = int(best_qp_idx)
+        else:
+            overall_metric = derf_metric_sum / max(derf_metric_count, 1.0)
+            best_qp_idx = int(np.nanargmin(overall_metric))
+            best_q0 = float(q_valid[best_qp_idx])
+            best_p0 = float(p_valid[best_qp_idx])
+            best_c = 1.0
+            best_value = float(overall_metric[best_qp_idx])
+            best_valid_idx = int(best_qp_idx)
+
+        theory_bundle = _theory_bundle_from_valid_idx(best_valid_idx)
+        return {
+            **sample_fit,
+            "metric": metric,
+            "mask_all_p_values": bool(mask_all_p_values),
+            "q0": best_q0,
+            "p0": best_p0,
+            "best_valid_idx": int(best_valid_idx),
+            "value": best_value,
+            "preln_scale_C": best_c,
+            "fit_pre_ln": bool(fit_pre_ln),
+            "theory_bundle": theory_bundle,
+            "per_curve_metric": _per_curve_direct_metric(
+                theory_bundle,
+                preln_data=preln_subset,
+                derf_data=derf_subset,
+                c_scale=best_c,
+            ),
+        }
+
+    new_samples = []
+    inverse_mape = []
+    direct_mape = []
+    for sample in fit_bundle["samples"]:
+        new_inverse = _inverse_refit(sample["inverse_fit"])
+        new_direct = _direct_refit(sample["direct_fit"])
+        new_samples.append({
+            **sample,
+            "inverse_fit": new_inverse,
+            "direct_fit": new_direct,
+        })
+        inverse_mape.append(float(new_inverse["value"]))
+        direct_mape.append(float(new_direct["value"]))
+
+    new_fit_bundle = {
+        **fit_bundle,
+        "inverse_mape": np.asarray(inverse_mape, dtype=float),
+        "direct_mape": np.asarray(direct_mape, dtype=float),
+        "samples": new_samples,
+        "refit_metadata": {
+            "q0_values": np.asarray(q0_values, dtype=float),
+            "p0_values": np.asarray(p0_values, dtype=float),
+            "c_values": np.asarray(c_values, dtype=float),
+            "metric": metric,
+            "n_tokens": int(n_tokens),
+            "fit_pre_ln": bool(fit_pre_ln),
+        },
+    }
+
+    return {
+        "fit_bundle": new_fit_bundle,
+        "inverse_scatter_bundle": fit_scatter_plot_data["inverse_scatter_bundle"],
+        "direct_scatter_bundle": fit_scatter_plot_data["direct_scatter_bundle"],
+    }
+
+
 def plot_fit_and_scatter_figure(
     fit_scatter_plot_data,
     style_cfg: FinalThreePanelStyleConfig,
@@ -5038,5 +5756,161 @@ def plot_panel_d_reduced_figure(
     cax.add_patch(rect)
     cax.text(1.06, -0.2, "pre-LN", transform=cax.transAxes, ha="center", va="top", fontsize=sizes["alpha_legend_fs"])
     _save_notebook_figure(fig, "panel_d_reduced_figure.pdf")
+    plt.show()
+    return fig
+
+
+def plot_inverse_fit_sample_diagnostics(
+    fit_scatter_plot_data,
+    sample_index: int,
+    style_cfg: FinalThreePanelStyleConfig,
+    apjn_direction: str = "inverse",
+    tick_fs=None,
+    label_fs=None,
+    alpha_legend_fs=None,
+    title_fs=None,
+    annotation_fs=None,
+):
+    if not isinstance(fit_scatter_plot_data, dict) or "fit_bundle" not in fit_scatter_plot_data:
+        raise TypeError(
+            "plot_inverse_fit_sample_diagnostics expects the result of "
+            "prepare_fit_and_scatter_plot_data(...)."
+        )
+
+    fit_bundle = fit_scatter_plot_data["fit_bundle"]
+    samples = fit_bundle.get("samples", [])
+    if sample_index < 0 or sample_index >= len(samples):
+        raise IndexError(f"sample_index={sample_index} is outside [0, {len(samples) - 1}]")
+
+    sample = samples[int(sample_index)]
+    apjn_direction = str(apjn_direction).lower()
+    if apjn_direction not in ("inverse", "direct"):
+        raise ValueError("apjn_direction must be 'inverse' or 'direct'.")
+
+    fit_obj = sample["inverse_fit"] if apjn_direction == "inverse" else sample["direct_fit"]
+    theory_bundle = fit_obj["theory_bundle"]
+    alphas = np.asarray(fit_bundle["alphas"], dtype=float)
+    colors = _make_alpha_colors(alphas)
+    sizes = _resolve_plot_text_sizes(
+        style_cfg,
+        tick_fs=tick_fs,
+        label_fs=label_fs,
+        alpha_legend_fs=alpha_legend_fs,
+        title_fs=title_fs,
+        annotation_fs=annotation_fs,
+    )
+
+    fig, axes = plt.subplots(2, 2, figsize=(13.4, 9.2))
+    ax_a, ax_b = axes[0, 0], axes[0, 1]
+    ax_c, ax_d = axes[1, 0], axes[1, 1]
+
+    if apjn_direction == "inverse":
+        arrs = fit_obj["panel_c_arrays"]
+        x_curve = np.arange(1, len(theory_bundle["preln"]["J"]), dtype=int)
+        x_pts = np.asarray(arrs["x_shift"], dtype=int) + 1
+        preln_curve = np.asarray(theory_bundle["preln"]["J"][1:], dtype=float)
+        preln_pts = np.asarray(arrs["preln_vit"], dtype=float)
+        derf_curves = {float(a): np.asarray(theory_bundle["derf"][float(a)]["J"][1:], dtype=float) for a in alphas}
+        derf_pts = {float(a): np.asarray(arrs["derf_vit"][float(a)], dtype=float) for a in alphas}
+        y_label = r"$\mathcal{J}^{\, B, b}$"
+        title_token = r"\mathcal{J}^{\, B, b}"
+    else:
+        vit_points = fit_obj["vit_points"]
+        preln_scale_C = fit_obj.get("preln_scale_C", 1.0)
+        preln_scale_C = 1.0 if preln_scale_C is None else float(preln_scale_C)
+        preln_layers = sorted(int(l) for l in vit_points.get("preln", {}).keys())
+        derf_layers = sorted({int(l) for d in vit_points.get("derf", {}).values() for l in d.keys()})
+        x_pts = np.asarray(preln_layers if preln_layers else derf_layers, dtype=int)
+        x_curve = np.arange(1, len(theory_bundle["preln"]["J_direct"]), dtype=int)
+        preln_curve = np.asarray(theory_bundle["preln"]["J_direct"][1:], dtype=float)
+        if preln_scale_C != 1.0:
+            preln_curve = preln_curve.copy()
+            preln_curve *= preln_scale_C
+        preln_pts = np.asarray([vit_points["preln"][l] for l in preln_layers], dtype=float) if preln_layers else np.empty(0, dtype=float)
+        derf_curves = {float(a): np.asarray(theory_bundle["derf"][float(a)]["J_direct"][1:], dtype=float) for a in alphas}
+        derf_pts = {
+            float(a): np.asarray([vit_points["derf"][float(a)][l] for l in sorted(vit_points["derf"][float(a)].keys())], dtype=float)
+            for a in alphas if float(a) in vit_points.get("derf", {})
+        }
+        y_label = r"$\mathcal{J}^{\, b, 0}$"
+        title_token = r"\mathcal{J}^{\, b, 0}"
+
+    ax_a.plot(x_curve, np.log(np.maximum(preln_curve, 1e-300)), color="black", lw=style_cfg.line_width, zorder=10)
+    if preln_pts.size:
+        ax_a.scatter(x_pts[:preln_pts.size], np.log(np.maximum(preln_pts, 1e-300)), color="black", s=18, zorder=11)
+    for i, a in enumerate(alphas):
+        if float(a) not in derf_curves:
+            continue
+        derf_J = np.asarray(derf_curves[float(a)], dtype=float)
+        ax_a.plot(x_curve, np.log(np.maximum(derf_J, 1e-300)), color=colors[i], lw=style_cfg.line_width, zorder=2)
+        if float(a) in derf_pts:
+            derf_x_pts = np.asarray(sorted(fit_obj["vit_points"]["derf"][float(a)].keys()), dtype=int) if apjn_direction == "direct" else x_pts
+            ax_a.scatter(
+                derf_x_pts,
+                np.log(np.maximum(derf_pts[float(a)], 1e-300)),
+                color=colors[i],
+                s=18,
+                zorder=3,
+            )
+    ax_a.set_title(rf"(a) $\log {title_token}$ vs. $b$", fontsize=sizes["title_fs"])
+    ax_a.set_xlabel(r"$b$", fontsize=sizes["label_fs"])
+    ax_a.set_ylabel(rf"$\log {title_token}$", fontsize=sizes["label_fs"])
+    prettify_axes(ax_a)
+    ax_a.tick_params(labelsize=sizes["tick_fs"])
+
+    for i, a in enumerate(alphas):
+        if float(a) not in derf_curves:
+            continue
+        derf_J = np.asarray(derf_curves[float(a)], dtype=float)
+        ax_b.plot(
+            x_curve,
+            np.log(np.maximum(derf_J, 1e-300)) ** 2,
+            color=colors[i],
+            lw=style_cfg.line_width,
+            zorder=2,
+        )
+        if float(a) in derf_pts:
+            derf_x_pts = np.asarray(sorted(fit_obj["vit_points"]["derf"][float(a)].keys()), dtype=int) if apjn_direction == "direct" else x_pts
+            ax_b.scatter(
+                derf_x_pts,
+                np.log(np.maximum(derf_pts[float(a)], 1e-300)) ** 2,
+                color=colors[i],
+                s=18,
+                zorder=3,
+            )
+    ax_b.set_title(rf"(b) $(\log {title_token})^2$ vs. $b$", fontsize=sizes["title_fs"])
+    ax_b.set_xlabel(r"$b$", fontsize=sizes["label_fs"])
+    ax_b.set_ylabel(rf"$(\log {title_token})^2$", fontsize=sizes["label_fs"])
+    prettify_axes(ax_b)
+    ax_b.tick_params(labelsize=sizes["tick_fs"])
+
+    ax_c.plot(x_curve, preln_curve, color="black", lw=style_cfg.line_width, zorder=10)
+    if preln_pts.size:
+        ax_c.scatter(x_pts[:preln_pts.size], preln_pts, color="black", s=18, zorder=11)
+    ax_c.set_title(rf"(c) pre-LN ${title_token}$", fontsize=sizes["title_fs"])
+    ax_c.set_xlabel(r"$b$", fontsize=sizes["label_fs"])
+    ax_c.set_ylabel(y_label, fontsize=sizes["label_fs"])
+    ax_c.set_xscale("log")
+    ax_c.set_yscale("log")
+    prettify_log_axis(ax_c, "x")
+    prettify_log_axis(ax_c, "y")
+    prettify_axes(ax_c)
+    ax_c.tick_params(labelsize=sizes["tick_fs"])
+
+    ax_d.axis("off")
+    legend_handles = [
+        Line2D([0], [0], color="black", lw=style_cfg.line_width, label="theory"),
+        Line2D([0], [0], color="black", marker="o", ls="none", markersize=4.5, label="ViT"),
+    ]
+    ax_d.legend(
+        handles=legend_handles,
+        frameon=False,
+        loc="upper left",
+        fontsize=sizes["annotation_fs"],
+    )
+    cax = ax_d.inset_axes([0.08, 0.18, 0.72, 0.22])
+    _draw_alpha_preln_legend_like_equangular(cax, alphas, colors, sizes["alpha_legend_fs"])
+
+    fig.tight_layout()
     plt.show()
     return fig
