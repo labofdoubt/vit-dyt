@@ -119,10 +119,38 @@ def _load_repo_module(module_name: str, relative_path: str):
     return module
 
 
+def _load_module_from_path(module_name: str, module_path: Path):
+    module_path = Path(module_path).resolve()
+    if not module_path.exists():
+        raise FileNotFoundError(f"Required module not found: {module_path}")
+    cache_key = f"_local_repo_{module_name}"
+    if cache_key in sys.modules:
+        return sys.modules[cache_key]
+    spec = importlib.util.spec_from_file_location(cache_key, module_path)
+    if spec is None or spec.loader is None:
+        raise ImportError(f"Could not load module spec for {module_path}")
+    module = importlib.util.module_from_spec(spec)
+    sys.modules[cache_key] = module
+    spec.loader.exec_module(module)
+    return module
+
+
 def _ensure_build_dataset():
     global build_dataset
     if build_dataset is None:
-        build_dataset = _load_repo_module("datasets", "datasets.py").build_dataset
+        mod = _load_repo_module("datasets", "datasets.py")
+        if hasattr(mod, "build_dataset"):
+            build_dataset = mod.build_dataset
+        else:
+            local_datasets = _load_module_from_path(
+                "datasets_fallback",
+                Path(__file__).resolve().with_name("datasets.py"),
+            )
+            if not hasattr(local_datasets, "build_dataset"):
+                raise AttributeError(
+                    "Could not find build_dataset in either repo datasets.py or local datasets.py"
+                )
+            build_dataset = local_datasets.build_dataset
     return build_dataset
 
 
@@ -631,6 +659,8 @@ class PermTokenConfig:
     num_model_inits: int = 1
     direct_layers: tuple | None = None
     direct_source_block: int = 1
+    attn_mult: float = 1.0
+    mlp_mult: float = 1.0
 
 @dataclass
 class APJNCifarConfig:
@@ -651,6 +681,8 @@ class APJNCifarConfig:
     j_num_draws: int = 10
     j_normalize_by: str = "Y"  # "Y" | "X" | "none"
     num_model_inits: int = 1
+    attn_mult: float = 1.0
+    mlp_mult: float = 1.0
 
 @dataclass
 class APJNFitConfig:
@@ -769,7 +801,7 @@ def tilde_p_erf_np(q, p, alpha):
 def erf_prime_sq_expect_np(q, alpha):
     return (4.0 * alpha**2 / np.pi) * (1.0 / np.sqrt(1.0 + 4.0 * alpha**2 * q))
 
-def simulate_recursions_full(
+def simulate_recursions_full_backup(
     num_layers: int,
     p0: float,
     n_tokens: int,
@@ -806,14 +838,17 @@ def simulate_recursions_full(
 
             chi_att[l] = 1.0
 
-            # beta = np.exp((sigma_a ** 2) * uq * (up - uq))
-            # gamma = np.exp((sigma_a ** 2) * up * (up - uq))
+            beta = np.exp((sigma_a ** 2) * uq * (up - uq))
+            gamma = np.exp((sigma_a ** 2) * up * (up - uq))
+            q_mix = (uq + (n - 1.0) * up * beta) / (1.0 + (n - 1.0) * beta)
+            p_mix = (uq + (n - 1.0) * up * gamma) / (1.0 + (n - 1.0) * gamma)
             if mask_all_p_values:
-                qh = ql + att_scale * up
+                qh = ql + att_scale * q_mix
+                # qh = ql + att_scale * up
                 ph = 0.0
             else:
-                # q_mix = (uq + (n - 1.0) * up * beta) / (1.0 + (n - 1.0) * beta)
-                # p_mix = (uq + (n - 1.0) * up * gamma) / (1.0 + (n - 1.0) * gamma)
+                # qh = ql + att_scale * q_mix
+                # ph = pl + att_scale * p_mix
                 qh = ql + att_scale * up
                 ph = pl + att_scale * up
 
@@ -831,18 +866,21 @@ def simulate_recursions_full(
 
         elif mode.lower() == "layernorm":
             rho = np.clip(pl / (ql + eps), -1.0, 1.0)
-            # beta = np.exp((sigma_a ** 2) * (rho - 1.0))
-            # gamma = np.exp((sigma_a ** 2) * rho * (rho - 1.0))
 
             qprime = 1.0 / (ql + eps)
             chi_att[l] = 1.0
 
+            beta = np.exp((sigma_a ** 2) * (rho - 1.0))
+            gamma = np.exp((sigma_a ** 2) * rho * (rho - 1.0))
+            q_mix = (1.0 + (n - 1.0) * rho * beta) / (1.0 + (n - 1.0) * beta)
+            p_mix = (1.0 + (n - 1.0) * rho * gamma) / (1.0 + (n - 1.0) * gamma)
             if mask_all_p_values:
-                qh = ql + att_scale * rho
+                qh = ql + att_scale * q_mix
+                # qh = ql + att_scale * rho
                 ph = 0.0
             else:
-                # q_mix = (1.0 + (n - 1.0) * rho * beta) / (1.0 + (n - 1.0) * beta)
-                # p_mix = (1.0 + (n - 1.0) * rho * gamma) / (1.0 + (n - 1.0) * gamma)
+                # qh = ql + att_scale * q_mix
+                # ph = pl + att_scale * p_mix
                 qh = ql + att_scale * rho
                 ph = pl + att_scale * rho
 
@@ -873,6 +911,157 @@ def simulate_recursions_full(
         "chi_att": chi_att,
         "chi_mlp": chi_mlp,
         "chi": chi,
+        "J": J,
+        "J_direct": J_direct,
+    }
+
+
+def simulate_recursions_full(
+    num_layers: int,
+    p0: float,
+    n_tokens: int,
+    mode: str,
+    alpha: float = 1.0,
+    sigma_w1: float = 0.64,
+    sigma_w2: float = 1.28,
+    sigma_o: float = 0.64,
+    sigma_v: float = 0.64,
+    sigma_a: float = 0.64 * 0.64,
+    q0: float = 1.0,
+    mask_all_p_values: bool = False,
+):
+    L = int(num_layers)
+    n = float(n_tokens)
+    eps = 1e-12
+
+    q = np.zeros(L + 1, dtype=float)
+    p = np.zeros(L + 1, dtype=float)
+    chi_att = np.zeros(L, dtype=float)
+    chi_mlp = np.zeros(L, dtype=float)
+    q_hat_arr = np.zeros(L, dtype=float)
+    p_hat_arr = np.zeros(L, dtype=float)
+    q_hat_half_arr = np.zeros(L, dtype=float)
+    p_hat_half_arr = np.zeros(L, dtype=float)
+    kappa_prime_arr = np.zeros(L, dtype=float)
+    K_direct = np.zeros(L + 1, dtype=float)
+    J_direct = np.zeros(L + 1, dtype=float)
+
+    q[0], p[0] = float(q0), float(0.0 if mask_all_p_values else p0)
+    K_direct[0] = 0.0
+    J_direct[0] = 1.0
+
+    att_scale = (sigma_o ** 2) * (sigma_v ** 2)
+    mlp_scale = (sigma_w1 ** 2) * (sigma_w2 ** 2)
+
+    for l in range(L):
+        ql, pl = q[l], p[l]
+
+        if mode.lower() == "erf":
+            denom = (1.0 + 2.0 * alpha**2 * ql) ** 2 - 4.0 * (alpha**4) * (pl**2)
+            p_hat = (4.0 * alpha**2 / np.pi) * (
+                1.0 / np.sqrt(np.maximum(denom, eps))
+            )
+            q_hat = (4.0 * alpha**2 / np.pi) * (
+                1.0 / np.sqrt(np.maximum(1.0 + 4.0 * alpha**2 * ql, eps))
+            )
+
+            uq = tilde_q_erf_np(ql, alpha)
+            up = tilde_p_erf_np(ql, pl, alpha)
+
+            beta = np.exp((sigma_a ** 2) * uq * (up - uq))
+            gamma = np.exp((sigma_a ** 2) * up * (up - uq))
+            q_mix = (uq + (n - 1.0) * up * beta) / (1.0 + (n - 1.0) * beta)
+            p_mix = (uq + (n - 1.0) * up * gamma) / (1.0 + (n - 1.0) * gamma)
+            if mask_all_p_values:
+                q_half = ql + att_scale * q_mix
+                p_half = 0.0
+            else:
+                q_half = ql + att_scale * up
+                p_half = pl + att_scale * up
+
+            denom_half = (1.0 + 2.0 * alpha**2 * q_half) ** 2 - 4.0 * (alpha**4) * (p_half**2)
+            p_hat_half = (4.0 * alpha**2 / np.pi) * (
+                1.0 / np.sqrt(np.maximum(denom_half, eps))
+            )
+            q_hat_half = (4.0 * alpha**2 / np.pi) * (
+                1.0 / np.sqrt(np.maximum(1.0 + 4.0 * alpha**2 * q_half, eps))
+            )
+
+            u_half = tilde_q_erf_np(q_half, alpha)
+            v_half = tilde_p_erf_np(q_half, p_half, alpha)
+            rho_half = np.clip(v_half / (u_half + eps), -1.0, 1.0)
+
+            dq_mlp = 0.5 * mlp_scale * u_half
+            dp_mlp = 0.0 if mask_all_p_values else mlp_scale * u_half * kappa_relu_np(rho_half)
+
+            q[l + 1] = q_half + dq_mlp
+            p[l + 1] = 0.0 if mask_all_p_values else p_half + dp_mlp
+
+        elif mode.lower() == "layernorm":
+            p_hat = 1.0 / (ql + eps)
+            q_hat = 1.0 / (ql + eps)
+
+            rho = np.clip(pl / (ql + eps), -1.0, 1.0)
+
+            beta = np.exp((sigma_a ** 2) * (rho - 1.0))
+            gamma = np.exp((sigma_a ** 2) * rho * (rho - 1.0))
+            q_mix = (1.0 + (n - 1.0) * rho * beta) / (1.0 + (n - 1.0) * beta)
+            p_mix = (1.0 + (n - 1.0) * rho * gamma) / (1.0 + (n - 1.0) * gamma)
+            if mask_all_p_values:
+                q_half = ql + att_scale * q_mix
+                p_half = 0.0
+            else:
+                q_half = ql + att_scale * rho
+                p_half = pl + att_scale * rho
+
+            q_hat_half = 1.0 / (q_half + eps)
+            p_hat_half = 1.0 / (q_half + eps)
+
+            rho_half = np.clip(p_half / (q_half + eps), -1.0, 1.0)
+            dq_mlp = 0.5 * mlp_scale
+            dp_mlp = 0.0 if mask_all_p_values else mlp_scale * kappa_relu_np(rho_half)
+
+            q[l + 1] = q_half + dq_mlp
+            p[l + 1] = 0.0 if mask_all_p_values else p_half + dp_mlp
+        else:
+            raise ValueError("mode must be 'erf' or 'layernorm'")
+
+        kappa_prime = 0.25 + (1.0 / (2.0 * np.pi)) * np.arcsin(np.clip(rho_half, -1.0, 1.0))
+        q_hat_arr[l] = q_hat
+        p_hat_arr[l] = p_hat
+        q_hat_half_arr[l] = q_hat_half
+        p_hat_half_arr[l] = p_hat_half
+        kappa_prime_arr[l] = kappa_prime
+
+        chi_att[l] = 1.0 + att_scale * p_hat
+        chi_mlp[l] = 1.0 + 0.5 * mlp_scale * q_hat_half
+
+        J_half = (1 + att_scale * q_hat / n) * J_direct[l] + att_scale * p_hat * K_direct[l]
+        K_direct_half = (1 + att_scale * p_hat) * K_direct[l] + (att_scale * q_hat / n) * J_direct[l]
+
+        K_direct[l + 1] = (1.0 + mlp_scale * kappa_prime * p_hat_half) * K_direct_half
+        J_direct[l + 1] = chi_mlp[l] * J_half
+
+    chi = chi_att * chi_mlp
+    J = np.zeros(L + 1, dtype=float)
+    K = np.zeros(L + 1, dtype=float)
+    J[L] = 1.0
+    K[L] = 0.0
+    for l in range(L - 1, -1, -1):
+        J_half = (1.0 + 0.5 * mlp_scale * q_hat_half_arr[l]) * J[l + 1]
+        K_half = (1.0 + mlp_scale * kappa_prime_arr[l] * p_hat_half_arr[l]) * K[l + 1]
+        J[l] = (1.0 + (att_scale / n) * q_hat_arr[l]) * J_half + att_scale * q_hat_arr[l] * K_half
+        K[l] = (1.0 + att_scale * p_hat_arr[l]) * K_half + (att_scale / n) * p_hat_arr[l] * J_half
+
+    return {
+        "q": q,
+        "p": p,
+        "p_over_q": _safe_divide(p, q),
+        "chi_att": chi_att,
+        "chi_mlp": chi_mlp,
+        "chi": chi,
+        "K": K,
+        "K_direct": K_direct,
         "J": J,
         "J_direct": J_direct,
     }
@@ -945,15 +1134,25 @@ def simulate_recursions_full_grid(
 
     G = q0_grid.size
     L = int(num_layers)
+    n = float(n_tokens)
     eps = 1e-12
 
     q = np.zeros((G, L + 1), dtype=float)
     p = np.zeros((G, L + 1), dtype=float)
     chi_att = np.zeros((G, L), dtype=float)
     chi_mlp = np.zeros((G, L), dtype=float)
+    q_hat_arr = np.zeros((G, L), dtype=float)
+    p_hat_arr = np.zeros((G, L), dtype=float)
+    q_hat_half_arr = np.zeros((G, L), dtype=float)
+    p_hat_half_arr = np.zeros((G, L), dtype=float)
+    kappa_prime_arr = np.zeros((G, L), dtype=float)
+    K_direct = np.zeros((G, L + 1), dtype=float)
+    J_direct = np.zeros((G, L + 1), dtype=float)
 
     q[:, 0] = q0_grid
     p[:, 0] = 0.0 if mask_all_p_values else p0_grid
+    K_direct[:, 0] = 0.0
+    J_direct[:, 0] = 1.0
 
     att_scale = (sigma_o ** 2) * (sigma_v ** 2)
     mlp_scale = (sigma_w1 ** 2) * (sigma_w2 ** 2)
@@ -963,66 +1162,110 @@ def simulate_recursions_full_grid(
         pl = p[:, l]
 
         if mode.lower() == "erf":
-            uq = tilde_q_erf_np(ql, alpha)
-            up = tilde_p_erf_np(ql, pl, alpha)
-            chi_att[:, l] = 1.0
-
-            if mask_all_p_values:
-                qh = ql + att_scale * up
-                ph = np.zeros_like(qh)
-            else:
-                qh = ql + att_scale * up
-                ph = pl + att_scale * up
-
-            chi_mlp[:, l] = 1.0 + mlp_scale * (2.0 * alpha**2 / np.pi) * (
-                1.0 / np.sqrt(1.0 + 4.0 * alpha**2 * qh)
+            denom = (1.0 + 2.0 * alpha**2 * ql) ** 2 - 4.0 * (alpha**4) * (pl**2)
+            p_hat = (4.0 * alpha**2 / np.pi) * (
+                1.0 / np.sqrt(np.maximum(denom, eps))
+            )
+            q_hat = (4.0 * alpha**2 / np.pi) * (
+                1.0 / np.sqrt(np.maximum(1.0 + 4.0 * alpha**2 * ql, eps))
             )
 
-            u_half = tilde_q_erf_np(qh, alpha)
-            v_half = tilde_p_erf_np(qh, ph, alpha)
+            uq = tilde_q_erf_np(ql, alpha)
+            up = tilde_p_erf_np(ql, pl, alpha)
+            if mask_all_p_values:
+                beta = np.exp((sigma_a ** 2) * uq * (up - uq))
+                q_mix = (uq + (n - 1.0) * up * beta) / (1.0 + (n - 1.0) * beta)
+                q_half = ql + att_scale * q_mix
+                p_half = np.zeros_like(q_half)
+            else:
+                q_half = ql + att_scale * up
+                p_half = pl + att_scale * up
+
+            denom_half = (1.0 + 2.0 * alpha**2 * q_half) ** 2 - 4.0 * (alpha**4) * (p_half**2)
+            p_hat_half = (4.0 * alpha**2 / np.pi) * (
+                1.0 / np.sqrt(np.maximum(denom_half, eps))
+            )
+            q_hat_half = (4.0 * alpha**2 / np.pi) * (
+                1.0 / np.sqrt(np.maximum(1.0 + 4.0 * alpha**2 * q_half, eps))
+            )
+
+            u_half = tilde_q_erf_np(q_half, alpha)
+            v_half = tilde_p_erf_np(q_half, p_half, alpha)
             rho_half = np.clip(v_half / (u_half + eps), -1.0, 1.0)
 
             dq_mlp = 0.5 * mlp_scale * u_half
             dp_mlp = np.zeros_like(dq_mlp) if mask_all_p_values else mlp_scale * u_half * kappa_relu_np(rho_half)
 
-            q[:, l + 1] = qh + dq_mlp
-            p[:, l + 1] = 0.0 if mask_all_p_values else ph + dp_mlp
+            q[:, l + 1] = q_half + dq_mlp
+            p[:, l + 1] = 0.0 if mask_all_p_values else p_half + dp_mlp
 
         elif mode.lower() == "layernorm":
+            p_hat = 1.0 / (ql + eps)
+            q_hat = 1.0 / (ql + eps)
             rho = np.clip(pl / (ql + eps), -1.0, 1.0)
-            chi_att[:, l] = 1.0
 
             if mask_all_p_values:
-                qh = ql + att_scale * rho
-                ph = np.zeros_like(qh)
+                beta = np.exp((sigma_a ** 2) * (rho - 1.0))
+                gamma = np.exp((sigma_a ** 2) * rho * (rho - 1.0))
+                q_mix = (1.0 + (n - 1.0) * rho * beta) / (1.0 + (n - 1.0) * beta)
+                p_mix = (1.0 + (n - 1.0) * rho * gamma) / (1.0 + (n - 1.0) * gamma)
+                q_half = ql + att_scale * q_mix
+                p_half = np.zeros_like(q_half)
             else:
-                qh = ql + att_scale * rho
-                ph = pl + att_scale * rho
+                beta = np.exp((sigma_a ** 2) * (rho - 1.0))
+                gamma = np.exp((sigma_a ** 2) * rho * (rho - 1.0))
+                q_mix = (1.0 + (n - 1.0) * rho * beta) / (1.0 + (n - 1.0) * beta)
+                p_mix = (1.0 + (n - 1.0) * rho * gamma) / (1.0 + (n - 1.0) * gamma)
+                q_half = ql + att_scale * rho
+                p_half = pl + att_scale * rho
 
-            chi_mlp[:, l] = 1.0 + mlp_scale / (2.0 * (qh + eps))
-            rho_half = np.clip(ph / (qh + eps), -1.0, 1.0)
-            dq_mlp = np.full_like(qh, 0.5 * mlp_scale)
-            dp_mlp = np.zeros_like(qh) if mask_all_p_values else mlp_scale * kappa_relu_np(rho_half)
+            q_hat_half = 1.0 / (q_half + eps)
+            p_hat_half = 1.0 / (q_half + eps)
+            rho_half = np.clip(p_half / (q_half + eps), -1.0, 1.0)
+            dq_mlp = np.full_like(q_half, 0.5 * mlp_scale)
+            dp_mlp = np.zeros_like(q_half) if mask_all_p_values else mlp_scale * kappa_relu_np(rho_half)
 
-            q[:, l + 1] = qh + dq_mlp
-            p[:, l + 1] = 0.0 if mask_all_p_values else ph + dp_mlp
+            q[:, l + 1] = q_half + dq_mlp
+            p[:, l + 1] = 0.0 if mask_all_p_values else p_half + dp_mlp
         else:
             raise ValueError("mode must be 'erf' or 'layernorm'")
 
-    chi = chi_att * chi_mlp
-    J_direct = np.ones((G, L + 1), dtype=float)
-    for l in range(L):
-        J_direct[:, l + 1] = J_direct[:, l] * chi[:, l]
+        kappa_prime = 0.25 + (1.0 / (2.0 * np.pi)) * np.arcsin(np.clip(rho_half, -1.0, 1.0))
+        q_hat_arr[:, l] = q_hat
+        p_hat_arr[:, l] = p_hat
+        q_hat_half_arr[:, l] = q_hat_half
+        p_hat_half_arr[:, l] = p_hat_half
+        kappa_prime_arr[:, l] = kappa_prime
 
-    J = np.ones((G, L + 1), dtype=float)
+        chi_att[:, l] = 1.0 + att_scale * p_hat
+        chi_mlp[:, l] = 1.0 + 0.5 * mlp_scale * q_hat_half
+
+        J_half = (1.0 + att_scale * q_hat / n) * J_direct[:, l] + att_scale * p_hat * K_direct[:, l]
+        K_direct_half = (1.0 + att_scale * p_hat) * K_direct[:, l] + (att_scale * q_hat / n) * J_direct[:, l]
+
+        K_direct[:, l + 1] = (1.0 + mlp_scale * kappa_prime * p_hat_half) * K_direct_half
+        J_direct[:, l + 1] = chi_mlp[:, l] * J_half
+
+    chi = chi_att * chi_mlp
+    J = np.zeros((G, L + 1), dtype=float)
+    K = np.zeros((G, L + 1), dtype=float)
     J[:, L] = 1.0
+    K[:, L] = 0.0
     for l in range(L - 1, -1, -1):
-        J[:, l] = J[:, l + 1] * chi[:, l]
+        J_half = (1.0 + 0.5 * mlp_scale * q_hat_half_arr[:, l]) * J[:, l + 1]
+        K_half = (1.0 + mlp_scale * kappa_prime_arr[:, l] * p_hat_half_arr[:, l]) * K[:, l + 1]
+        J[:, l] = (1.0 + (att_scale / n) * q_hat_arr[:, l]) * J_half + att_scale * q_hat_arr[:, l] * K_half
+        K[:, l] = (1.0 + att_scale * p_hat_arr[:, l]) * K_half + (att_scale / n) * p_hat_arr[:, l] * J_half
 
     return {
         "q": q,
         "p": p,
+        "p_over_q": _safe_divide(p, q),
+        "chi_att": chi_att,
+        "chi_mlp": chi_mlp,
         "chi": chi,
+        "K": K,
+        "K_direct": K_direct,
         "J": J,
         "J_direct": J_direct,
     }
@@ -1365,18 +1608,32 @@ def build_vit(model_cfg: ModelConfig, *, use_derf: bool):
     return model
 
 
-def scale_vit_value_attn_init_std(model: nn.Module, multiplier: float):
-    if float(multiplier) <= 0.0:
+def scale_vit_mlp_and_value_attn_init_std(
+    model: nn.Module,
+    *,
+    mlp_multiplier: float = 1.0,
+    attn_multiplier: float = 1.0,
+):
+    if float(mlp_multiplier) <= 0.0:
+        raise ValueError("MLP multiplier must be positive.")
+    if float(attn_multiplier) <= 0.0:
         raise ValueError("Attention multiplier must be positive.")
-    if abs(float(multiplier) - 1.0) < 1e-12:
+    if abs(float(mlp_multiplier) - 1.0) < 1e-12 and abs(float(attn_multiplier) - 1.0) < 1e-12:
         return model
     if not hasattr(model, "blocks"):
         raise ValueError("This scaling utility expects a ViT with a `blocks` attribute.")
 
     with torch.no_grad():
         for bi, block in enumerate(model.blocks):
+            mlp = getattr(block, "mlp", None)
+            if mlp is not None and abs(float(mlp_multiplier) - 1.0) >= 1e-12:
+                for attr in ("fc1", "fc2"):
+                    layer = getattr(mlp, attr, None)
+                    if isinstance(layer, nn.Linear):
+                        layer.weight.mul_(float(mlp_multiplier))
+
             attn = getattr(block, "attn", None)
-            if attn is None:
+            if attn is None or abs(float(attn_multiplier) - 1.0) < 1e-12:
                 continue
 
             qkv = getattr(attn, "qkv", None)
@@ -1387,13 +1644,21 @@ def scale_vit_value_attn_init_std(model: nn.Module, multiplier: float):
                         f"Block {bi}: expected qkv.weight first dim divisible by 3, got {out_dim}."
                     )
                 third = out_dim // 3
-                qkv.weight[2 * third : 3 * third].mul_(float(multiplier))
+                qkv.weight[2 * third : 3 * third].mul_(float(attn_multiplier))
 
             proj = getattr(attn, "proj", None)
             if isinstance(proj, nn.Linear):
-                proj.weight.mul_(float(multiplier))
+                proj.weight.mul_(float(attn_multiplier))
 
     return model
+
+
+def scale_vit_value_attn_init_std(model: nn.Module, multiplier: float):
+    return scale_vit_mlp_and_value_attn_init_std(
+        model,
+        mlp_multiplier=1.0,
+        attn_multiplier=float(multiplier),
+    )
 
 @torch.no_grad()
 def set_all_derf_alpha_(model: nn.Module, alpha_value: float) -> int:
@@ -2033,7 +2298,13 @@ def _average_scalar_dicts(dict_list):
         out[int(k)] = float(np.mean(vals))
     return out
 
-def collect_block0_input_stats(model: nn.Module, images: torch.Tensor, block0_input_override: torch.Tensor | None = None):
+def collect_block_input_dot_stats(
+    model: nn.Module,
+    images: torch.Tensor,
+    *,
+    block_indices=(0,),
+    block0_input_override: torch.Tensor | None = None,
+):
     model.eval()
     with torch.no_grad():
         X_list, _ = capture_X_list_and_logits(
@@ -2048,19 +2319,35 @@ def collect_block0_input_stats(model: nn.Module, images: torch.Tensor, block0_in
             perm_random_rotate=False,
             block0_input_override=block0_input_override,
         )
-    X0 = X_list[0].detach().to(torch.float32)
-    X0 = _maybe_drop_cls(X0, exclude_cls=True)
-    token_vals = (X0.pow(2).sum(dim=-1) / X0.shape[-1]).reshape(-1).cpu().numpy()
-    if X0.shape[1] >= 2:
-        gram = (X0 @ X0.transpose(-1, -2)) / X0.shape[-1]
-        mask = ~torch.eye(X0.shape[1], dtype=torch.bool, device=X0.device).unsqueeze(0)
-        pairwise_vals = gram.masked_select(mask).cpu().numpy()
-    else:
-        pairwise_vals = np.empty(0, dtype=float)
-    return {
-        "token_sqnorm_over_d": token_vals,
-        "pairwise_dot_over_d": pairwise_vals,
-    }
+    n_available = len(X_list) - 1
+    block_indices = tuple(int(b) for b in block_indices)
+    out = {}
+    for b in block_indices:
+        if b < 0 or b > n_available:
+            raise ValueError(f"Requested block index {b} outside valid range [0, {n_available}].")
+        xb = X_list[b].detach().to(torch.float32)
+        xb = _maybe_drop_cls(xb, exclude_cls=True)
+        token_vals = (xb.pow(2).sum(dim=-1) / xb.shape[-1]).reshape(-1).cpu().numpy()
+        if xb.shape[1] >= 2:
+            gram = (xb @ xb.transpose(-1, -2)) / xb.shape[-1]
+            mask = ~torch.eye(xb.shape[1], dtype=torch.bool, device=xb.device).unsqueeze(0)
+            pairwise_vals = gram.masked_select(mask).cpu().numpy()
+        else:
+            pairwise_vals = np.empty(0, dtype=float)
+        out[int(b)] = {
+            "token_sqnorm_over_d": token_vals,
+            "pairwise_dot_over_d": pairwise_vals,
+        }
+    return out
+
+
+def collect_block0_input_stats(model: nn.Module, images: torch.Tensor, block0_input_override: torch.Tensor | None = None):
+    return collect_block_input_dot_stats(
+        model,
+        images,
+        block_indices=(0,),
+        block0_input_override=block0_input_override,
+    )[0]
 
 
 def collect_restored_cifar_block0_dot_stats(
@@ -2070,6 +2357,7 @@ def collect_restored_cifar_block0_dot_stats(
     sample_index: int,
     use_derf: bool = False,
     alpha: float | None = None,
+    block_indices=(0,),
     std_threshold: float = 0.0,
     max_epochs_to_search: int = 20,
     clear_cache: bool = True,
@@ -2091,16 +2379,29 @@ def collect_restored_cifar_block0_dot_stats(
     try:
         if bool(use_derf) and alpha is not None:
             set_all_derf_alpha_(model, float(alpha))
-        block0_stats = collect_block0_input_stats(model, restored["samples"])
+        block_stats = collect_block_input_dot_stats(
+            model,
+            restored["samples"],
+            block_indices=block_indices,
+        )
     finally:
         del model
         cuda_cleanup()
+    first_block = int(tuple(int(b) for b in block_indices)[0])
     return {
         **restored,
         "model_kind": "derf" if bool(use_derf) else "preln",
         "alpha": None if alpha is None else float(alpha),
-        "token_sqnorm_over_d": np.asarray(block0_stats["token_sqnorm_over_d"], dtype=float),
-        "pairwise_dot_over_d": np.asarray(block0_stats["pairwise_dot_over_d"], dtype=float),
+        "block_indices": tuple(int(b) for b in block_indices),
+        "block_stats": {
+            int(b): {
+                "token_sqnorm_over_d": np.asarray(v["token_sqnorm_over_d"], dtype=float),
+                "pairwise_dot_over_d": np.asarray(v["pairwise_dot_over_d"], dtype=float),
+            }
+            for b, v in block_stats.items()
+        },
+        "token_sqnorm_over_d": np.asarray(block_stats[first_block]["token_sqnorm_over_d"], dtype=float),
+        "pairwise_dot_over_d": np.asarray(block_stats[first_block]["pairwise_dot_over_d"], dtype=float),
     }
 
 
@@ -2137,7 +2438,51 @@ def plot_restored_cifar_block0_dot_histograms(
     *,
     figure_title="Distributions of inputs to transformer block 1",
 ):
-    return plot_block0_stats_histograms(block0_stats, figure_title=figure_title)
+    block_stats = block0_stats.get("block_stats") if isinstance(block0_stats, dict) else None
+    if not block_stats:
+        return plot_block0_stats_histograms(block0_stats, figure_title=figure_title)
+
+    block_ids = [int(b) for b in block0_stats.get("block_indices", sorted(block_stats.keys()))]
+    n_blocks = len(block_ids)
+    fig, axes = plt.subplots(n_blocks, 2, figsize=(10.0, 3.4 * n_blocks), squeeze=False)
+    for row, b in enumerate(block_ids):
+        stats = block_stats[int(b)]
+        token_vals = np.asarray(stats["token_sqnorm_over_d"], dtype=float)
+        pairwise_vals = np.asarray(stats["pairwise_dot_over_d"], dtype=float)
+        tok_mean = float(token_vals.mean()) if token_vals.size else float("nan")
+        tok_std = float(token_vals.std(ddof=0)) if token_vals.size else float("nan")
+        pair_mean = float(pairwise_vals.mean()) if pairwise_vals.size else float("nan")
+        pair_std = float(pairwise_vals.std(ddof=0)) if pairwise_vals.size else float("nan")
+
+        ax_q = axes[row, 0]
+        ax_p = axes[row, 1]
+        ax_q.hist(token_vals, bins=40, color="#1f77b4", alpha=0.85)
+        ax_q.set_title(f"Block index {b}: q histogram")
+        ax_q.set_xlabel(r"$x_i^T x_i / d$")
+        ax_q.set_ylabel("count")
+        ax_q.text(
+            0.02, 0.95, f"mean={tok_mean:.3f}, std={tok_std:.3f}",
+            transform=ax_q.transAxes, va="top", ha="left", fontsize=10,
+            bbox=dict(facecolor="white", alpha=0.7, edgecolor="none"),
+        )
+
+        if pairwise_vals.size:
+            ax_p.hist(pairwise_vals, bins=40, color="#ff7f0e", alpha=0.85)
+            ax_p.text(
+                0.02, 0.95, f"mean={pair_mean:.3f}, std={pair_std:.3f}",
+                transform=ax_p.transAxes, va="top", ha="left", fontsize=10,
+                bbox=dict(facecolor="white", alpha=0.7, edgecolor="none"),
+            )
+        else:
+            ax_p.text(0.5, 0.5, "Not enough tokens for pairwise dots", ha="center", va="center")
+        ax_p.set_title(f"Block index {b}: p histogram")
+        ax_p.set_xlabel(r"$x_i^T x_j / d$")
+        ax_p.set_ylabel("count")
+
+    fig.suptitle(figure_title, y=1.0)
+    fig.tight_layout()
+    plt.show()
+    return fig
 
 
 def preview_apjn_sample_stats(model_cfg: ModelConfig, apjn_cfg: APJNCifarConfig):
@@ -2160,6 +2505,11 @@ def preview_apjn_sample_stats(model_cfg: ModelConfig, apjn_cfg: APJNCifarConfig)
             max_epochs_to_search=apjn_cfg.cifar_max_epochs_to_search,
         )
         preview_model = build_vit(model_cfg, use_derf=False)
+        scale_vit_mlp_and_value_attn_init_std(
+            preview_model,
+            mlp_multiplier=float(apjn_cfg.mlp_mult),
+            attn_multiplier=float(apjn_cfg.attn_mult),
+        )
         try:
             block0_stats = collect_block0_input_stats(preview_model, samples)
         finally:
@@ -2173,6 +2523,11 @@ def preview_apjn_sample_stats(model_cfg: ModelConfig, apjn_cfg: APJNCifarConfig)
         num_classes=model_cfg.num_classes,
     )
     preview_model = build_vit(model_cfg, use_derf=False)
+    scale_vit_mlp_and_value_attn_init_std(
+        preview_model,
+        mlp_multiplier=float(apjn_cfg.mlp_mult),
+        attn_multiplier=float(apjn_cfg.attn_mult),
+    )
     try:
         seq_len, embed_dim = get_vit_seq_len_and_dim(preview_model)
         block0_input_override = make_apjn_equiangular_block0_batch(
@@ -2234,7 +2589,17 @@ def run_perm_token_experiment(
         cuda_cleanup()
 
         preln_model = build_vit(model_cfg, use_derf=False)
+        scale_vit_mlp_and_value_attn_init_std(
+            preln_model,
+            mlp_multiplier=float(perm_cfg.mlp_mult),
+            attn_multiplier=float(perm_cfg.attn_mult),
+        )
         derf_model = build_vit(model_cfg, use_derf=True)
+        scale_vit_mlp_and_value_attn_init_std(
+            derf_model,
+            mlp_multiplier=float(perm_cfg.mlp_mult),
+            attn_multiplier=float(perm_cfg.attn_mult),
+        )
 
         if depth is None:
             depth = len(preln_model.blocks)
@@ -2325,7 +2690,17 @@ def run_cifar_apjn_experiment(
         cuda_cleanup()
 
         preln_model = build_vit(model_cfg, use_derf=False)
+        scale_vit_mlp_and_value_attn_init_std(
+            preln_model,
+            mlp_multiplier=float(apjn_cfg.mlp_mult),
+            attn_multiplier=float(apjn_cfg.attn_mult),
+        )
         derf_model = build_vit(model_cfg, use_derf=True)
+        scale_vit_mlp_and_value_attn_init_std(
+            derf_model,
+            mlp_multiplier=float(apjn_cfg.mlp_mult),
+            attn_multiplier=float(apjn_cfg.attn_mult),
+        )
 
         if depth is None:
             depth = len(preln_model.blocks)
@@ -3640,15 +4015,26 @@ def plot_final_three_panel(
 
 # -------------------- notebook-specific helpers --------------------
 
-def build_mean_field_cfg_for_vit_base(depth: int | None = None) -> MeanFieldConfig:
+def build_mean_field_cfg_for_vit_base(
+    depth: int | None = None,
+    *,
+    attn_mult: float = 1.0,
+    mlp_mult: float = 1.0,
+) -> MeanFieldConfig:
     # Matches the scaling used in vit_apjn_theory_plots.py for ViT-Base (d = 768).
     del depth
     scale = math.sqrt(768.0 / 1024.0)
+    attn_mult = float(attn_mult)
+    mlp_mult = float(mlp_mult)
+    if attn_mult <= 0.0:
+        raise ValueError("attn_mult must be positive.")
+    if mlp_mult <= 0.0:
+        raise ValueError("mlp_mult must be positive.")
     return MeanFieldConfig(
-        sigma_w1=0.64 * scale,
-        sigma_w2=1.28 * scale,
-        sigma_o=0.64 * scale,
-        sigma_v=0.64 * scale,
+        sigma_w1=0.64 * scale * mlp_mult,
+        sigma_w2=1.28 * scale * mlp_mult,
+        sigma_o=0.64 * scale * attn_mult,
+        sigma_v=0.64 * scale * attn_mult,
         sigma_a=0.64 * 0.64 * 768.0 / 1024.0,
     )
 
@@ -3945,7 +4331,19 @@ def _resolve_plot_text_sizes(
     }
 
 
-def _draw_alpha_preln_legend_like_equangular(cax, alphas, colors, alpha_legend_fs):
+def _draw_alpha_preln_legend_like_equangular(
+    cax,
+    alphas,
+    colors,
+    alpha_legend_fs,
+    *,
+    preln_rect_x=1.02,
+    preln_rect_y=0.05,
+    preln_rect_width=0.08,
+    preln_rect_height=0.9,
+    preln_label_x=1.06,
+    preln_label_y=-0.2,
+):
     add_alpha_colorbar_horizontal_single(
         cax,
         alphas,
@@ -3954,9 +4352,9 @@ def _draw_alpha_preln_legend_like_equangular(cax, alphas, colors, alpha_legend_f
         cb_fs=alpha_legend_fs,
     )
     rect = mpatches.Rectangle(
-        (1.02, 0.05),
-        0.08,
-        0.9,
+        (preln_rect_x, preln_rect_y),
+        preln_rect_width,
+        preln_rect_height,
         transform=cax.transAxes,
         facecolor="black",
         edgecolor="black",
@@ -3964,8 +4362,8 @@ def _draw_alpha_preln_legend_like_equangular(cax, alphas, colors, alpha_legend_f
     )
     cax.add_patch(rect)
     cax.text(
-        1.06,
-        -0.2,
+        preln_label_x,
+        preln_label_y,
         "pre-LN",
         transform=cax.transAxes,
         ha="center",
@@ -4162,6 +4560,70 @@ def plot_equangular_p_inverse_direct_figure(
     _draw_alpha_preln_legend_like_equangular(cax, alphas, colors, sizes["alpha_legend_fs"])
 
     _save_notebook_figure(fig, "equiangular_p_inverse_direct_figure.pdf")
+    plt.show()
+    return fig
+
+
+def plot_equangular_qp_figure(
+    perm_theory_bundle,
+    style_cfg: FinalThreePanelStyleConfig,
+    panel_gap_ab=0.18,
+    tick_fs=None,
+    label_fs=None,
+    alpha_legend_fs=None,
+    title_fs=None,
+    annotation_fs=None,
+):
+    alphas = np.asarray(sorted(float(a) for a in perm_theory_bundle["derf"].keys()), dtype=float)
+    colors = _make_alpha_colors(alphas)
+    sizes = _resolve_plot_text_sizes(
+        style_cfg,
+        tick_fs=tick_fs,
+        label_fs=label_fs,
+        alpha_legend_fs=alpha_legend_fs,
+        title_fs=title_fs,
+        annotation_fs=annotation_fs,
+    )
+
+    fig = plt.figure(figsize=(10.8, 4.8))
+    gs = fig.add_gridspec(
+        2,
+        3,
+        height_ratios=[1.0, 0.18],
+        width_ratios=[1.0, panel_gap_ab, 1.0],
+        hspace=0.18,
+        wspace=0.0,
+    )
+    ax_q = fig.add_subplot(gs[0, 0])
+    ax_p = fig.add_subplot(gs[0, 2])
+    cax = fig.add_subplot(gs[1, :])
+
+    l = np.asarray(perm_theory_bundle["l"], dtype=float)
+    ax_q.plot(l, perm_theory_bundle["preln"]["q"], color="black", lw=style_cfg.line_width)
+    ax_p.plot(l, perm_theory_bundle["preln"]["p"], color="black", lw=style_cfg.line_width)
+    for i, a in enumerate(alphas):
+        ax_q.plot(l, perm_theory_bundle["derf"][float(a)]["q"], color=colors[i], lw=style_cfg.line_width)
+        ax_p.plot(l, perm_theory_bundle["derf"][float(a)]["p"], color=colors[i], lw=style_cfg.line_width)
+
+    ax_q.set_title(r"(a) $Q^b$", fontsize=sizes["title_fs"])
+    ax_q.set_xlabel(r"$b$", fontsize=sizes["label_fs"])
+    ax_q.set_ylabel(r"$Q$", fontsize=sizes["label_fs"])
+    prettify_axes(ax_q)
+    ax_q.tick_params(labelsize=sizes["tick_fs"])
+
+    ax_p.set_title(r"(b) $P^b$", fontsize=sizes["title_fs"])
+    ax_p.set_xlabel(r"$b$", fontsize=sizes["label_fs"])
+    ax_p.set_ylabel(r"$P$", fontsize=sizes["label_fs"])
+    prettify_axes(ax_p)
+    ax_p.tick_params(labelsize=sizes["tick_fs"])
+
+    center_shrink_axis(cax, width_scale=0.62, height_scale=0.75)
+    if style_cfg.colorbar_pad:
+        pos = cax.get_position()
+        cax.set_position([pos.x0, pos.y0 - style_cfg.colorbar_pad, pos.width, pos.height])
+    _draw_alpha_preln_legend_like_equangular(cax, alphas, colors, sizes["alpha_legend_fs"])
+
+    _save_notebook_figure(fig, "equiangular_qp_figure.pdf")
     plt.show()
     return fig
 
@@ -4533,6 +4995,8 @@ def run_cifar_fit_histograms(
     max_epochs_to_search: int = 20,
     j_num_draws: int = 10,
     num_model_inits: int = 1,
+    attn_mult: float = 1.0,
+    mlp_mult: float = 1.0,
     q0_values=None,
     p0_values=None,
     preln_scale_values=None,
@@ -4620,6 +5084,8 @@ def run_cifar_fit_histograms(
                 "max_epochs_to_search": int(max_epochs_to_search),
                 "j_num_draws": int(j_num_draws),
                 "num_model_inits": int(num_model_inits),
+                "attn_mult": float(attn_mult),
+                "mlp_mult": float(mlp_mult),
                 "randomized_sampling": not bool(deterministic),
                 "rescale_vit_preln_apjn": bool(rescale_vit_preln_apjn),
                 "mask_all_p_values": bool(mask_all_p_values),
@@ -4667,6 +5133,8 @@ def run_cifar_fit_histograms(
             j_num_draws=int(j_num_draws),
             j_normalize_by="Y",
             num_model_inits=int(num_model_inits),
+            attn_mult=float(attn_mult),
+            mlp_mult=float(mlp_mult),
         )
         model_seed = (
             int(model_cfg.seed) + int(draw_index) * int(num_model_inits)
@@ -4738,6 +5206,7 @@ def run_cifar_inverse_apjn_points(
     num_model_inits: int = 1,
     deterministic: bool = False,
     attn_mult: float = 1.0,
+    mlp_mult: float = 1.0,
     save_every_n_samples: int = 25,
     save_results: bool = False,
     save_root: str = "/content/drive/MyDrive/ml_projects/mapes_variance",
@@ -4813,6 +5282,7 @@ def run_cifar_inverse_apjn_points(
                 "deterministic": bool(deterministic),
                 "save_every_n_samples": int(save_every_n_samples),
                 "attn_mult": float(attn_mult),
+                "mlp_mult": float(mlp_mult),
                 "inverse_only": True,
             },
         }
@@ -4905,9 +5375,17 @@ def run_cifar_inverse_apjn_points(
             cuda_cleanup()
 
             preln_model = build_vit(model_cfg_draw, use_derf=False)
-            scale_vit_value_attn_init_std(preln_model, float(attn_mult))
+            scale_vit_mlp_and_value_attn_init_std(
+                preln_model,
+                mlp_multiplier=float(mlp_mult),
+                attn_multiplier=float(attn_mult),
+            )
             derf_model = build_vit(model_cfg_draw, use_derf=True)
-            scale_vit_value_attn_init_std(derf_model, float(attn_mult))
+            scale_vit_mlp_and_value_attn_init_std(
+                derf_model,
+                mlp_multiplier=float(mlp_mult),
+                attn_multiplier=float(attn_mult),
+            )
             try:
                 if seq_len is None or embed_dim is None:
                     seq_len, embed_dim = get_vit_seq_len_and_dim(preln_model)
@@ -4923,6 +5401,12 @@ def run_cifar_inverse_apjn_points(
                 for a in alpha_list:
                     a_float = float(a)
                     set_all_derf_alpha_(derf_model, a_float)
+                    # print(derf_model)
+                    # print(derf_model.blocks[0].attn.qkv.weight[:2*768].std())
+                    # print(derf_model.blocks[0].attn.qkv.weight[2*768:].std())
+                    # print(derf_model.blocks[0].attn.proj.weight.std())
+                    # print(derf_model.blocks[0].mlp.fc1.weight.std())
+                    # print(derf_model.blocks[0].mlp.fc2.weight.std())
                     derf_runs[a_float].append(
                         estimate_J_points_hutchinson(
                             derf_model,
@@ -5255,7 +5739,8 @@ def refit_fit_scatter_plot_data(
     *,
     n_tokens: int,
     q0_values,
-    p0_values,
+    p0_values=None,
+    rho0_values=None,
     c_values,
     metric: str = "mape",
     fit_pre_ln: bool = True,
@@ -5271,11 +5756,19 @@ def refit_fit_scatter_plot_data(
     alphas = np.asarray(fit_bundle["alphas"], dtype=float)
     depth = int(fit_bundle["depth"])
     q0_values = _resolve_grid_values(q0_values, len(q0_values))
-    p0_values = _resolve_grid_values(p0_values, len(p0_values))
+    rho0_grid = None
+    if rho0_values is not None:
+        rho0_grid = _resolve_grid_values(rho0_values, len(rho0_values))
+        q_mesh, rho_mesh = np.meshgrid(q0_values, rho0_grid, indexing="xy")
+        p_mesh = q_mesh * rho_mesh
+    else:
+        if p0_values is None:
+            raise ValueError("Provide either p0_values or rho0_values.")
+        p0_values = _resolve_grid_values(p0_values, len(p0_values))
+        q_mesh, p_mesh = np.meshgrid(q0_values, p0_values, indexing="xy")
     c_values = _resolve_grid_values(c_values, len(c_values))
     metric = str(metric).lower()
     mask_all_p_values = bool(mask_all_p_values)
-    q_mesh, p_mesh = np.meshgrid(q0_values, p0_values, indexing="xy")
     valid_mask = p_mesh <= q_mesh + 1e-12
     if not np.any(valid_mask):
         raise RuntimeError("No valid (q0, p0) pairs satisfy p0 <= q0.")
@@ -5283,6 +5776,7 @@ def refit_fit_scatter_plot_data(
     linear_to_valid = {int(lin): idx for idx, lin in enumerate(valid_linear_idx.tolist())}
     q_valid = q_mesh[valid_mask]
     p_valid = p_mesh[valid_mask]
+    p0_values_used = np.unique(np.asarray(p_valid, dtype=float))
 
     preln_grid_full = simulate_recursions_full_grid(
         num_layers=depth,
@@ -5384,10 +5878,11 @@ def refit_fit_scatter_plot_data(
             "metric": metric,
             "mask_all_p_values": bool(mask_all_p_values),
             "q0_values": q0_values,
-            "p0_values": p0_values,
+            "p0_values": p0_values_used,
+            "rho0_values": None if rho0_grid is None else rho0_grid,
             "metric_matrix": metric_matrix,
             "q0": float(q0_values[iq_best]),
-            "p0": float(p0_values[ip_best]),
+            "p0": float(p_mesh[ip_best, iq_best]),
             "best_valid_idx": int(best_valid_idx),
             "value": float(metric_matrix[ip_best, iq_best]),
             "per_curve_metric": per_curve_metric,
@@ -5538,7 +6033,8 @@ def refit_fit_scatter_plot_data(
         "samples": new_samples,
         "refit_metadata": {
             "q0_values": np.asarray(q0_values, dtype=float),
-            "p0_values": np.asarray(p0_values, dtype=float),
+            "p0_values": None if rho0_grid is not None else np.asarray(p0_values, dtype=float),
+            "rho0_values": None if rho0_grid is None else np.asarray(rho0_grid, dtype=float),
             "c_values": np.asarray(c_values, dtype=float),
             "metric": metric,
             "n_tokens": int(n_tokens),
@@ -5678,6 +6174,140 @@ def plot_fit_and_scatter_figure(
         cax.set_position([pos.x0, pos.y0 - style_cfg.colorbar_pad, pos.width, pos.height])
     _draw_alpha_preln_legend_like_equangular(cax, alphas, colors, sizes["alpha_legend_fs"])
     _save_notebook_figure(fig, "fit_and_scatter_figure.pdf")
+    plt.show()
+    return fig
+
+
+def plot_scatter_only_figure(
+    fit_scatter_plot_data,
+    style_cfg: FinalThreePanelStyleConfig,
+    *,
+    alphas=None,
+    panel_gap_ab=0.18,
+    lower_row_to_colorbar_gap=0.18,
+    legend_width_scale=0.82,
+    legend_height_scale=0.75,
+    colorbar_width_scale=None,
+    colorbar_height_scale=None,
+    colorbar_x_shift=0.0,
+    colorbar_y_shift=0.0,
+    tick_fs=None,
+    label_fs=None,
+    alpha_legend_fs=None,
+    title_fs=None,
+    scatter_point_alpha=0.55,
+    preln_rect_width=0.08,
+    preln_rect_height=0.9,
+):
+    if not isinstance(fit_scatter_plot_data, dict) or "inverse_scatter_bundle" not in fit_scatter_plot_data:
+        raise TypeError(
+            "plot_scatter_only_figure expects the result of "
+            "prepare_fit_and_scatter_plot_data(...)."
+        )
+    inverse_scatter_bundle = fit_scatter_plot_data["inverse_scatter_bundle"]
+    direct_scatter_bundle = fit_scatter_plot_data["direct_scatter_bundle"]
+    all_alphas = np.asarray(direct_scatter_bundle["alphas"], dtype=float)
+
+    def _resolve_requested_alphas(requested, available, tol=1e-8):
+        available = np.asarray(available, dtype=float)
+        if requested is None:
+            return available
+        resolved = []
+        for val in np.asarray(requested, dtype=float):
+            idx = int(np.argmin(np.abs(available - float(val))))
+            matched = float(available[idx])
+            if abs(matched - float(val)) > tol:
+                raise ValueError(
+                    f"Requested alpha={float(val)} is not available. "
+                    f"Closest available alpha is {matched}."
+                )
+            if matched not in resolved:
+                resolved.append(matched)
+        return np.asarray(resolved, dtype=float)
+
+    if alphas is None:
+        shown_alphas = all_alphas
+    else:
+        shown_alphas = _resolve_requested_alphas(alphas, all_alphas)
+    shown_alpha_set = {float(a) for a in shown_alphas.tolist()}
+    colors = _make_alpha_colors(all_alphas)
+    alpha_to_color = {float(a): colors[i] for i, a in enumerate(all_alphas)}
+    shown_colors = [alpha_to_color[float(a)] for a in shown_alphas]
+
+    sizes = _resolve_plot_text_sizes(
+        style_cfg,
+        tick_fs=tick_fs,
+        label_fs=label_fs,
+        alpha_legend_fs=alpha_legend_fs,
+        title_fs=title_fs,
+    )
+
+    fig = plt.figure(figsize=(13.8, 6.6))
+    gs = fig.add_gridspec(
+        3,
+        3,
+        height_ratios=[1.0, lower_row_to_colorbar_gap, 0.18],
+        width_ratios=[1.0, panel_gap_ab, 1.0],
+        hspace=0.0,
+        wspace=0.0,
+    )
+    ax_inv = fig.add_subplot(gs[0, 0])
+    ax_dir = fig.add_subplot(gs[0, 2])
+    cax = fig.add_subplot(gs[2, :])
+
+    for point in inverse_scatter_bundle.get("points", []):
+        if point["model_kind"] == "preln":
+            color = "black"
+        else:
+            a = float(point["alpha"])
+            if a not in shown_alpha_set:
+                continue
+            color = alpha_to_color[a]
+        ax_inv.scatter(point["layer"], point["value"], color=color, s=18, alpha=float(scatter_point_alpha))
+    ax_inv.set_title(r"(a) $\mathcal{J}^{\, B, b}$ across samples", fontsize=sizes["title_fs"])
+    ax_inv.set_xlabel(r"$b$", fontsize=sizes["label_fs"])
+    ax_inv.set_ylabel(r"$\mathcal{J}^{\, B, b}$", fontsize=sizes["label_fs"])
+    ax_inv.set_yscale("log")
+    prettify_log_axis(ax_inv, "y")
+    prettify_axes(ax_inv)
+    ax_inv.tick_params(labelsize=sizes["tick_fs"])
+
+    for point in direct_scatter_bundle.get("points", []):
+        if point["model_kind"] == "preln":
+            color = "black"
+        else:
+            a = float(point["alpha"])
+            if a not in shown_alpha_set:
+                continue
+            color = alpha_to_color[a]
+        ax_dir.scatter(point["layer"], point["value"], color=color, s=18, alpha=float(scatter_point_alpha))
+    ax_dir.set_title(r"(b) $\mathcal{J}^{\, b, 0}$ across samples", fontsize=sizes["title_fs"])
+    ax_dir.set_xlabel(r"$b$", fontsize=sizes["label_fs"])
+    ax_dir.set_ylabel(r"$\mathcal{J}^{\, b, 0}$", fontsize=sizes["label_fs"])
+    ax_dir.set_yscale("log")
+    prettify_log_axis(ax_dir, "y")
+    prettify_axes(ax_dir)
+    ax_dir.tick_params(labelsize=sizes["tick_fs"])
+
+    final_width_scale = legend_width_scale if colorbar_width_scale is None else colorbar_width_scale
+    final_height_scale = legend_height_scale if colorbar_height_scale is None else colorbar_height_scale
+    center_shrink_axis(cax, width_scale=final_width_scale, height_scale=final_height_scale)
+    pos = cax.get_position()
+    cax.set_position([
+        pos.x0 + float(colorbar_x_shift),
+        pos.y0 - style_cfg.colorbar_pad + float(colorbar_y_shift),
+        pos.width,
+        pos.height,
+    ])
+    _draw_alpha_preln_legend_like_equangular(
+        cax,
+        shown_alphas,
+        shown_colors,
+        sizes["alpha_legend_fs"],
+        preln_rect_width=float(preln_rect_width),
+        preln_rect_height=float(preln_rect_height),
+    )
+    _save_notebook_figure(fig, "scatter_only_figure.pdf")
     plt.show()
     return fig
 
