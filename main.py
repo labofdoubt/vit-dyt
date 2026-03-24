@@ -240,6 +240,24 @@ def set_vit_block_norm_gamma_init(model: nn.Module, value: float):
                     module.weight.fill_(value)
 
 
+def set_vit_final_norm_gamma_init(model: nn.Module, value: float):
+    """
+    Set the affine weight for the final ViT normalization layer only.
+    Prefers `fc_norm` when present, otherwise falls back to `norm`.
+    """
+    norm = None
+    if hasattr(model, "fc_norm") and getattr(model.fc_norm, "weight", None) is not None:
+        norm = model.fc_norm
+    elif hasattr(model, "norm") and getattr(model.norm, "weight", None) is not None:
+        norm = model.norm
+
+    if norm is None:
+        raise ValueError("Final norm gamma initialization currently supports ViT models with a writable `fc_norm` or `norm` weight.")
+
+    with torch.no_grad():
+        norm.weight.fill_(value)
+
+
 def replace_vit_final_fc_norm_with_derf(model: nn.Module, alpha_init_value: float):
     """
     Replace only ViT `fc_norm` with DynamicErf, leaving block-local norms unchanged.
@@ -301,6 +319,8 @@ def get_args_parser():
                         help='If true, replace ViT norm_pre with a LayerNorm so the input is normalized before transformer block 0.')
     parser.add_argument('--block_layernorm_gamma_init_value', type=float, default=None,
                         help='If set, initialize the affine weight of normalization layers inside ViT transformer blocks to this value. Excludes norm_pre and fc_norm.')
+    parser.add_argument('--final_layernorm_gamma_init_value', type=float, default=None,
+                        help='If set, initialize the affine weight of the final ViT normalization layer (`fc_norm` if present, otherwise `norm`). Excludes `norm_pre`.')
     parser.add_argument('--layer_scale_init_value', default=1e-6, type=float,
                         help="Layer scale initial values")
 
@@ -613,6 +633,10 @@ def main(args):
         if "vit" not in args.model:
             raise ValueError("--block_layernorm_gamma_init_value currently supports ViT models only.")
         set_vit_block_norm_gamma_init(model, value=args.block_layernorm_gamma_init_value)
+    if args.final_layernorm_gamma_init_value is not None:
+        if "vit" not in args.model:
+            raise ValueError("--final_layernorm_gamma_init_value currently supports ViT models only.")
+        set_vit_final_norm_gamma_init(model, value=args.final_layernorm_gamma_init_value)
     if args.use_learnable_post_layernorm_scale and args.use_learnable_post_fc_norm_scale:
         raise ValueError("Choose only one of --use_learnable_post_layernorm_scale or --use_learnable_post_fc_norm_scale")
     if args.use_learnable_post_layernorm_scale:

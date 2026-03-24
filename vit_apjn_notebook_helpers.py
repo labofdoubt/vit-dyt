@@ -5497,9 +5497,18 @@ def run_random_direct_scatter(
     # For each sample, choose one model uniformly from Derf(alpha) and pre-LN.
     rng = np.random.default_rng()
     depth = int(model_cfg.depth)
+    folder_name = _folder_name_with_postfix(
+        f"random_direct_depth{depth}_layers{int(layers_per_sample)}",
+        result_postfix,
+    )
+    existing_results_path = Path(save_root) / folder_name / "results.pkl"
     loader_seed_random = int(rng.integers(0, 2**31 - 1))
+    layer_choice_seed_base = int(rng.integers(0, 2**31 - 1))
+    model_choice_seed_base = int(rng.integers(0, 2**31 - 1))
+    model_seed_base = int(rng.integers(0, 2**31 - 1))
     candidate_layers = np.arange(1, depth + 1, dtype=int)
     points = []
+    start_index = 0
     model_choices = ["preln"] + [float(a) for a in np.asarray(alphas, dtype=float)]
     model_probs = np.ones(len(model_choices), dtype=float)
     model_probs[0] = float(preln_weight)
@@ -5507,11 +5516,76 @@ def run_random_direct_scatter(
         raise ValueError("preln_weight must be positive.")
     model_probs = model_probs / model_probs.sum()
 
-    for draw_index in tqdm(range(int(n_samples)), desc="run_random_direct_scatter", leave=False):
+    if save_results and (not rewrite) and existing_results_path.exists():
+        existing_bundle = load_saved_bundle(existing_results_path)
+        points = list(existing_bundle.get("points", []))
+        saved_cfg = existing_bundle.get("config", {}) if isinstance(existing_bundle, dict) else {}
+        if "loader_seed_random" in saved_cfg and saved_cfg["loader_seed_random"] is not None:
+            loader_seed_random = int(saved_cfg["loader_seed_random"])
+        if "layer_choice_seed_base" in saved_cfg and saved_cfg["layer_choice_seed_base"] is not None:
+            layer_choice_seed_base = int(saved_cfg["layer_choice_seed_base"])
+        if "model_choice_seed_base" in saved_cfg and saved_cfg["model_choice_seed_base"] is not None:
+            model_choice_seed_base = int(saved_cfg["model_choice_seed_base"])
+        if "model_seed_base" in saved_cfg and saved_cfg["model_seed_base"] is not None:
+            model_seed_base = int(saved_cfg["model_seed_base"])
+        done_samples = sorted({int(point["sample"]) for point in points if "sample" in point})
+        start_index = 0 if not done_samples else int(max(done_samples) + 1)
+        print(
+            f"Resuming run_random_direct_scatter from existing results: "
+            f"{start_index} samples already saved in {existing_results_path}"
+        )
+
+    if start_index >= int(n_samples):
+        out = {
+            "points": points,
+            "alphas": np.asarray(alphas, dtype=float),
+            "depth": int(depth),
+            "layers_per_sample": int(layers_per_sample),
+            "config": {
+                "n_samples": int(n_samples),
+                "preln_weight": float(preln_weight),
+                "rescale_vit_preln_apjn": bool(rescale_vit_preln_apjn),
+                "batch_seed": None,
+                "scatter_seed": None,
+                "loader_seed_random": int(loader_seed_random),
+                "layer_choice_seed_base": int(layer_choice_seed_base),
+                "model_choice_seed_base": int(model_choice_seed_base),
+                "model_seed_base": int(model_seed_base),
+                "std_threshold": float(std_threshold),
+                "max_epochs_to_search": int(max_epochs_to_search),
+                "j_num_draws": int(j_num_draws),
+                "randomized_sampling": True,
+            },
+        }
+        if save_results:
+            out["saved_path"] = str(existing_results_path)
+        return out
+
+    preview_indices = set(range(start_index, min(int(n_samples), start_index + 2)))
+
+    for draw_index in tqdm(range(start_index, int(n_samples)), desc="run_random_direct_scatter", leave=False):
+        layer_rng = np.random.default_rng(int(layer_choice_seed_base) + int(draw_index))
+        model_choice_rng = np.random.default_rng(int(model_choice_seed_base) + int(draw_index))
         layer_count = min(int(layers_per_sample), candidate_layers.size)
-        chosen_layers = tuple(sorted(int(x) for x in rng.choice(candidate_layers, size=layer_count, replace=False)))
-        model_choice = model_choices[int(rng.choice(len(model_choices), p=model_probs))]
-        seed_all(int(rng.integers(0, 2**31 - 1)))
+        chosen_layers = tuple(sorted(int(x) for x in layer_rng.choice(candidate_layers, size=layer_count, replace=False)))
+        model_choice = model_choices[int(model_choice_rng.choice(len(model_choices), p=model_probs))]
+        if draw_index in preview_indices:
+            seed_all(loader_seed_random + int(draw_index))
+            preview_samples, _, _ = get_cifar_batch(
+                batch_size=1,
+                img_size=model_cfg.img_size,
+                num_classes=model_cfg.num_classes,
+                loader_seed=loader_seed_random,
+                draw_index=int(draw_index),
+                std_threshold=float(std_threshold),
+                max_epochs_to_search=int(max_epochs_to_search),
+            )
+            preview_vals = preview_samples.reshape(-1)[:8].detach().cpu().numpy()
+            print(
+                f"[resume preview] draw_index={draw_index} layers={chosen_layers} "
+                f"first8={np.array2string(preview_vals, precision=5, separator=', ')}"
+            )
+        seed_all(loader_seed_random + int(draw_index))
         cuda_cleanup()
         samples, _, batch_meta = get_cifar_batch(
             batch_size=1,
@@ -5522,7 +5596,7 @@ def run_random_direct_scatter(
             std_threshold=float(std_threshold),
             max_epochs_to_search=int(max_epochs_to_search),
         )
-        model_cfg_draw = replace(model_cfg, seed=int(rng.integers(0, 2**31 - 1)))
+        model_cfg_draw = replace(model_cfg, seed=int(model_seed_base) + int(draw_index))
         model = build_vit(model_cfg_draw, use_derf=model_choice != "preln")
         try:
             if model_choice != "preln":
@@ -5573,6 +5647,9 @@ def run_random_direct_scatter(
             "batch_seed": None,
             "scatter_seed": None,
             "loader_seed_random": int(loader_seed_random),
+            "layer_choice_seed_base": int(layer_choice_seed_base),
+            "model_choice_seed_base": int(model_choice_seed_base),
+            "model_seed_base": int(model_seed_base),
             "std_threshold": float(std_threshold),
             "max_epochs_to_search": int(max_epochs_to_search),
             "j_num_draws": int(j_num_draws),
@@ -5583,12 +5660,9 @@ def run_random_direct_scatter(
         saved_path, out = _save_bundle_pickle(
             out,
             save_root=save_root,
-            folder_name=_folder_name_with_postfix(
-                f"random_direct_depth{depth}_layers{int(layers_per_sample)}",
-                result_postfix,
-            ),
+            folder_name=folder_name,
             filename="results.pkl",
-            rewrite=bool(rewrite),
+            rewrite=True,
             merge_kind="points",
         )
         out["saved_path"] = str(saved_path)
@@ -5616,9 +5690,18 @@ def run_random_inverse_scatter(
     # For each sample, choose one model uniformly from Derf(alpha) and pre-LN.
     rng = np.random.default_rng()
     depth = int(model_cfg.depth)
+    folder_name = _folder_name_with_postfix(
+        f"random_inverse_depth{depth}_layers{int(layers_per_sample)}",
+        result_postfix,
+    )
+    existing_results_path = Path(save_root) / folder_name / "results.pkl"
     loader_seed_random = int(rng.integers(0, 2**31 - 1))
+    layer_choice_seed_base = int(rng.integers(0, 2**31 - 1))
+    model_choice_seed_base = int(rng.integers(0, 2**31 - 1))
+    model_seed_base = int(rng.integers(0, 2**31 - 1))
     candidate_layers = np.arange(1, depth, dtype=int)
     points = []
+    start_index = 0
     model_choices = ["preln"] + [float(a) for a in np.asarray(alphas, dtype=float)]
     model_probs = np.ones(len(model_choices), dtype=float)
     model_probs[0] = float(preln_weight)
@@ -5626,11 +5709,75 @@ def run_random_inverse_scatter(
         raise ValueError("preln_weight must be positive.")
     model_probs = model_probs / model_probs.sum()
 
-    for draw_index in tqdm(range(int(n_samples)), desc="run_random_inverse_scatter", leave=False):
+    if save_results and (not rewrite) and existing_results_path.exists():
+        existing_bundle = load_saved_bundle(existing_results_path)
+        points = list(existing_bundle.get("points", []))
+        saved_cfg = existing_bundle.get("config", {}) if isinstance(existing_bundle, dict) else {}
+        if "loader_seed_random" in saved_cfg and saved_cfg["loader_seed_random"] is not None:
+            loader_seed_random = int(saved_cfg["loader_seed_random"])
+        if "layer_choice_seed_base" in saved_cfg and saved_cfg["layer_choice_seed_base"] is not None:
+            layer_choice_seed_base = int(saved_cfg["layer_choice_seed_base"])
+        if "model_choice_seed_base" in saved_cfg and saved_cfg["model_choice_seed_base"] is not None:
+            model_choice_seed_base = int(saved_cfg["model_choice_seed_base"])
+        if "model_seed_base" in saved_cfg and saved_cfg["model_seed_base"] is not None:
+            model_seed_base = int(saved_cfg["model_seed_base"])
+        done_samples = sorted({int(point["sample"]) for point in points if "sample" in point})
+        start_index = 0 if not done_samples else int(max(done_samples) + 1)
+        print(
+            f"Resuming run_random_inverse_scatter from existing results: "
+            f"{start_index} samples already saved in {existing_results_path}"
+        )
+
+    if start_index >= int(n_samples):
+        out = {
+            "points": points,
+            "alphas": np.asarray(alphas, dtype=float),
+            "depth": int(depth),
+            "layers_per_sample": int(layers_per_sample),
+            "config": {
+                "n_samples": int(n_samples),
+                "preln_weight": float(preln_weight),
+                "batch_seed": None,
+                "scatter_seed": None,
+                "loader_seed_random": int(loader_seed_random),
+                "layer_choice_seed_base": int(layer_choice_seed_base),
+                "model_choice_seed_base": int(model_choice_seed_base),
+                "model_seed_base": int(model_seed_base),
+                "std_threshold": float(std_threshold),
+                "max_epochs_to_search": int(max_epochs_to_search),
+                "j_num_draws": int(j_num_draws),
+                "randomized_sampling": True,
+            },
+        }
+        if save_results:
+            out["saved_path"] = str(existing_results_path)
+        return out
+
+    preview_indices = set(range(start_index, min(int(n_samples), start_index + 2)))
+
+    for draw_index in tqdm(range(start_index, int(n_samples)), desc="run_random_inverse_scatter", leave=False):
+        layer_rng = np.random.default_rng(int(layer_choice_seed_base) + int(draw_index))
+        model_choice_rng = np.random.default_rng(int(model_choice_seed_base) + int(draw_index))
         layer_count = min(int(layers_per_sample), candidate_layers.size)
-        chosen_layers = tuple(sorted(int(x) for x in rng.choice(candidate_layers, size=layer_count, replace=False)))
-        model_choice = model_choices[int(rng.choice(len(model_choices), p=model_probs))]
-        seed_all(int(rng.integers(0, 2**31 - 1)))
+        chosen_layers = tuple(sorted(int(x) for x in layer_rng.choice(candidate_layers, size=layer_count, replace=False)))
+        model_choice = model_choices[int(model_choice_rng.choice(len(model_choices), p=model_probs))]
+        if draw_index in preview_indices:
+            seed_all(loader_seed_random + int(draw_index))
+            preview_samples, _, _ = get_cifar_batch(
+                batch_size=1,
+                img_size=model_cfg.img_size,
+                num_classes=model_cfg.num_classes,
+                loader_seed=loader_seed_random,
+                draw_index=int(draw_index),
+                std_threshold=float(std_threshold),
+                max_epochs_to_search=int(max_epochs_to_search),
+            )
+            preview_vals = preview_samples.reshape(-1)[:8].detach().cpu().numpy()
+            print(
+                f"[resume preview] draw_index={draw_index} layers={chosen_layers} "
+                f"first8={np.array2string(preview_vals, precision=5, separator=', ')}"
+            )
+        seed_all(loader_seed_random + int(draw_index))
         cuda_cleanup()
         samples, _, batch_meta = get_cifar_batch(
             batch_size=1,
@@ -5641,7 +5788,7 @@ def run_random_inverse_scatter(
             std_threshold=float(std_threshold),
             max_epochs_to_search=int(max_epochs_to_search),
         )
-        model_cfg_draw = replace(model_cfg, seed=int(rng.integers(0, 2**31 - 1)))
+        model_cfg_draw = replace(model_cfg, seed=int(model_seed_base) + int(draw_index))
         model = build_vit(model_cfg_draw, use_derf=model_choice != "preln")
         try:
             if model_choice != "preln":
@@ -5678,6 +5825,9 @@ def run_random_inverse_scatter(
             "batch_seed": None,
             "scatter_seed": None,
             "loader_seed_random": int(loader_seed_random),
+            "layer_choice_seed_base": int(layer_choice_seed_base),
+            "model_choice_seed_base": int(model_choice_seed_base),
+            "model_seed_base": int(model_seed_base),
             "std_threshold": float(std_threshold),
             "max_epochs_to_search": int(max_epochs_to_search),
             "j_num_draws": int(j_num_draws),
@@ -5688,12 +5838,9 @@ def run_random_inverse_scatter(
         saved_path, out = _save_bundle_pickle(
             out,
             save_root=save_root,
-            folder_name=_folder_name_with_postfix(
-                f"random_inverse_depth{depth}_layers{int(layers_per_sample)}",
-                result_postfix,
-            ),
+            folder_name=folder_name,
             filename="results.pkl",
-            rewrite=bool(rewrite),
+            rewrite=True,
             merge_kind="points",
         )
         out["saved_path"] = str(saved_path)
@@ -6198,6 +6345,8 @@ def plot_scatter_only_figure(
     scatter_point_alpha=0.55,
     preln_rect_width=0.08,
     preln_rect_height=0.9,
+    preln_label_x=1.06,
+    preln_label_y=-0.2,
 ):
     if not isinstance(fit_scatter_plot_data, dict) or "inverse_scatter_bundle" not in fit_scatter_plot_data:
         raise TypeError(
@@ -6306,6 +6455,8 @@ def plot_scatter_only_figure(
         sizes["alpha_legend_fs"],
         preln_rect_width=float(preln_rect_width),
         preln_rect_height=float(preln_rect_height),
+        preln_label_x=float(preln_label_x),
+        preln_label_y=float(preln_label_y),
     )
     _save_notebook_figure(fig, "scatter_only_figure.pdf")
     plt.show()
